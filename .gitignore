@@ -1,0 +1,24 @@
+# Node.js
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+
+# Env
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / temp
+dist/
+build/
+.tmp/
+
+# PowerShell
+*.ps1.bak
