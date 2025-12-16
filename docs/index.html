@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>HDUD API — Developer Portal v0.5</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        body {
+            margin: 0; font-family: Arial, Helvetica, sans-serif;
+            background: #0f0f0f; color: #f5f5f5;
+        }
+        header {
+            padding: 30px; text-align: center;
+            background: linear-gradient(135deg, #111, #222, #000);
+            border-bottom: 1px solid #333;
+        }
+        h1 { margin: 0; font-size: 36px; letter-spacing: 1px; }
+        p { color: #ccc; }
+
+        .container {
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+
+        .card {
+            background: #1a1a1a;
+            padding: 25px;
+            border-radius: 10px;
+            border: 1px solid #2a2a2a;
+            margin-bottom: 25px;
+            transition: 0.3s;
+        }
+
+        .card:hover { border-color: #444; }
+
+        a.button {
+            display: inline-block;
+            padding: 12px 18px;
+            border-radius: 8px;
+            margin-top: 10px;
+            text-decoration: none;
+            background: #0066ff;
+            color: white;
+            font-weight: bold;
+        }
+
+        pre {
+            background: #000;
+            padding: 15px;
+            border-radius: 8px;
+            color: #0f0;
+            overflow-x: auto;
+        }
+
+        footer {
+            text-align: center;
+            padding: 20px;
+            margin-top: 40px;
+            color: #555;
+        }
+    </style>
+</head>
+
+<body>
+
+<header>
+    <h1>HDUD API — Core v0.5</h1>
+    <p>A Documentação Oficial do Motor de Memórias & Identidade</p>
+</header>
+
+<div class="container">
+
+    <div class="card">
+        <h2>🔗 Swagger UI</h2>
+        <p>Interface interativa para testar todos os endpoints.</p>
+        <a class="button" href="/docs/swagger">Abrir Swagger</a>
+    </div>
+
+    <div class="card">
+        <h2>📘 Redoc Viewer</h2>
+        <p>Documentação técnica gerada automaticamente via OpenAPI.</p>
+        <a class="button" href="/docs/redoc">Abrir Redoc</a>
+    </div>
+
+    <div class="card">
+        <h2>📄 Arquivos OpenAPI</h2>
+        <a class="button" href="/docs/openapi.json">openapi.json</a>
+        <a class="button" href="/docs/openapi.yaml" style="background:#888;">openapi.yaml</a>
+    </div>
+
+    <div class="card">
+        <h2>⚙ Como usar no Postman</h2>
+        <pre>
+Import → Link → http://localhost:4000/docs/openapi.json
+        </pre>
+    </div>
+
+</div>
+
+<footer>
+    HDUD © 2025 — Developer Portal v0.5
+</footer>
+
+</body>
+</html>

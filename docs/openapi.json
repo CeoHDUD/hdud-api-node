@@ -1,0 +1,274 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "HDUD Core API",
+    "version": "0.5.0",
+    "description": "API oficial da plataforma HDUD — versão 0.5\nInclui autenticação JWT, CRUD de memórias com versionamento, rollback e ferramentas de auditoria narrativa."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4000",
+      "description": "Ambiente local (dev)"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "Memory": {
+        "type": "object",
+        "properties": {
+          "memory_id": { "type": "integer" },
+          "author_id": { "type": "integer" },
+          "title": { "type": "string" },
+          "content": { "type": "string" },
+          "version_number": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "is_deleted": { "type": "boolean" }
+        }
+      },
+      "TimelineEvent": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string" },
+          "version_number": { "type": "integer" },
+          "title": { "type": "string" },
+          "content": { "type": "string" },
+          "event_time": { "type": "string", "format": "date-time" },
+          "event_author": { "type": "string" },
+          "event_type": { "type": "string" },
+          "restored_version": { "type": ["string", "null"] },
+          "snapshot_version": { "type": ["string", "null"] }
+        }
+      }
+    }
+  },
+
+  "security": [
+    { "BearerAuth": [] }
+  ],
+
+  "paths": {
+    "/auth/signup": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Criar conta",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "email": { "type": "string" },
+                  "password": { "type": "string" }
+                },
+                "required": ["name", "email", "password"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Conta criada com sucesso"
+          }
+        }
+      }
+    },
+
+    "/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Login e obtenção de token JWT",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": { "type": "string" },
+                  "password": { "type": "string" }
+                },
+                "required": ["email", "password"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login bem-sucedido, token JWT retornado"
+          }
+        }
+      }
+    },
+
+    "/memory": {
+      "get": {
+        "tags": ["memory"],
+        "summary": "Listar memórias (paginação v0.5)",
+        "parameters": [
+          { "name": "page", "in": "query", "schema": { "type": "integer" } },
+          { "name": "pageSize", "in": "query", "schema": { "type": "integer" } },
+          { "name": "search", "in": "query", "schema": { "type": "string" } },
+          { "name": "sort", "in": "query", "schema": { "type": "string", "default": "updated_at" } },
+          { "name": "order", "in": "query", "schema": { "type": "string", "enum": ["ASC", "DESC"], "default": "DESC" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lista de memórias",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "page": { "type": "integer" },
+                    "pageSize": { "type": "integer" },
+                    "total": { "type": "integer" },
+                    "data": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Memory" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+
+      "post": {
+        "tags": ["memory"],
+        "summary": "Criar memória com versionamento inicial",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": { "type": "string" },
+                  "content": { "type": "string" }
+                },
+                "required": ["title", "content"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Memória criada" }
+        }
+      }
+    },
+
+    "/memory/{id}": {
+      "get": {
+        "tags": ["memory"],
+        "summary": "Obter detalhes da memória",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Detalhes da memória",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Memory" }
+              }
+            }
+          }
+        }
+      },
+
+      "put": {
+        "tags": ["memory"],
+        "summary": "Atualizar memória com versionamento",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": { "type": "string" },
+                  "content": { "type": "string" }
+                },
+                "required": ["title", "content"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Memória atualizada" }
+        }
+      }
+    },
+
+    "/memory/{id}/rollback": {
+      "post": {
+        "tags": ["memory"],
+        "summary": "Rollback da memória para uma versão específica",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "version": { "type": "integer" }
+                },
+                "required": ["version"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Rollback realizado" }
+        }
+      }
+    },
+
+    "/memory/{id}/timeline": {
+      "get": {
+        "tags": ["memory"],
+        "summary": "Timeline completa da memória",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Eventos da timeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "memory_id": { "type": "integer" },
+                    "timeline": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/TimelineEvent" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
