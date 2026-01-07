@@ -2,9 +2,9 @@ openapi: 3.0.3
 
 info:
   title: HDUD API Core
-  version: 0.7.0
+  version: 0.7.1
   description: >
-    HDUD Core API (v0.7) — Auth + Authors + Memories (versioning, ledger, rollback, timeline).
+    HDUD Core API (v0.7.1) — Auth + Authors + Memories (versioning, ledger, rollback, timeline).
     Unicode-safe end-to-end (NVARCHAR + mssql NVarChar). All protected endpoints use Bearer JWT.
 
 servers:
@@ -16,6 +16,10 @@ tags:
   - name: Auth
   - name: Authors
   - name: Memories
+
+# Global security (tools-friendly). Public endpoints can override with "security: []".
+security:
+  - BearerAuth: []
 
 components:
   securitySchemes:
@@ -30,6 +34,9 @@ components:
       properties:
         error:
           type: string
+        request_id:
+          type: string
+          format: uuid
       required: [error]
 
     HealthResponse:
@@ -38,6 +45,7 @@ components:
         status: { type: string, example: ok }
         db: { type: string, example: connected }
         version: { type: string, example: HDUD-API-Node v0.7 }
+      required: [status, db, version]
 
     AuthSignupRequest:
       type: object
@@ -62,35 +70,39 @@ components:
         email: { type: string, format: email }
         created_at: { type: string, format: date-time }
         full_name: { type: string, nullable: true }
-        author_id: { type: string, nullable: true, example: "1" }
+        author_id: { type: integer, nullable: true, example: 1 }
         roles:
           type: array
           items: { type: string, example: AUTHOR_SELF }
+      required: [user_id, email, created_at, roles]
+
+    AuthAuthor:
+      type: object
+      properties:
+        author_id: { type: integer, example: 1 }
+        author_code: { type: string, example: ALE-0001 }
+        full_name: { type: string }
+        created_at: { type: string, format: date-time }
+      required: [author_id, author_code, full_name, created_at]
 
     AuthSignupResponse:
       type: object
       properties:
         user: { $ref: "#/components/schemas/AuthUser" }
-        author:
-          type: object
-          properties:
-            author_id: { type: integer, example: 1 }
-            author_code: { type: string, example: ALE-0001 }
-            full_name: { type: string }
-            created_at: { type: string, format: date-time }
-        token: { type: string }
+        author: { $ref: "#/components/schemas/AuthAuthor" }
+        token: { type: string, description: Legacy/alias for access_token (optional) }
         access_token: { type: string }
         refresh_token: { type: string }
-      required: [user, token]
+      required: [user, access_token, refresh_token]
 
     AuthLoginResponse:
       type: object
       properties:
         user: { $ref: "#/components/schemas/AuthUser" }
-        token: { type: string }
+        token: { type: string, description: Legacy/alias for access_token (optional) }
         access_token: { type: string }
         refresh_token: { type: string }
-      required: [user, token]
+      required: [user, access_token, refresh_token]
 
     MemoryCreateRequest:
       type: object
@@ -103,6 +115,7 @@ components:
           type: string
           example: "ÁÉÍÓÚ — memória máquina coração funcionando corretamente."
       required: [title, content]
+      additionalProperties: false
 
     MemoryUpdateRequest:
       type: object
@@ -176,6 +189,7 @@ paths:
     get:
       tags: [Health]
       summary: Health check
+      security: []  # public
       responses:
         "200":
           description: OK
@@ -192,6 +206,7 @@ paths:
     post:
       tags: [Auth]
       summary: Sign up (creates user + optionally links/creates author)
+      security: []  # public
       requestBody:
         required: true
         content:
@@ -213,6 +228,7 @@ paths:
     post:
       tags: [Auth]
       summary: Login (returns JWT tokens)
+      security: []  # public
       requestBody:
         required: true
         content:
@@ -234,7 +250,6 @@ paths:
     get:
       tags: [Memories, Authors]
       summary: List memories for an author (RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: author_id
           in: path
@@ -262,7 +277,6 @@ paths:
     post:
       tags: [Memories, Authors]
       summary: Create a memory for an author (version 1; RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: author_id
           in: path
@@ -299,7 +313,6 @@ paths:
     get:
       tags: [Memories]
       summary: Get memory by id (RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: memory_id
           in: path
@@ -325,7 +338,6 @@ paths:
     put:
       tags: [Memories]
       summary: Update memory (creates a new version; RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: memory_id
           in: path
@@ -362,7 +374,6 @@ paths:
     get:
       tags: [Memories]
       summary: Get ledger events (versions) for a memory (RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: memory_id
           in: path
@@ -391,7 +402,6 @@ paths:
     post:
       tags: [Memories]
       summary: Rollback memory to a previous version (creates a new version; RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: memory_id
           in: path
@@ -427,7 +437,6 @@ paths:
     get:
       tags: [Memories]
       summary: Get consolidated timeline for a memory (RBAC + ownership enforced)
-      security: [{ BearerAuth: [] }]
       parameters:
         - name: memory_id
           in: path

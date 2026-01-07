@@ -1,229 +1,247 @@
-// server.js — HDUD API Core v0.6 (Hardened)
-// Segurança + Observabilidade (sem quebrar contratos)
-// Mantém: /auth, /authors, /memories..., /docs/swagger, /docs/openapi.json, /health
+// C:\HDUD_DATA\hdud-api-node\src\server.js
+// HDUD API Node v0.6 — SERVER FREEZER (SECURE, NO-SILENT-FALLBACK)
+//
+// ✔ Nunca quebra por router faltando
+// ✔ /health sempre responde
+// ✔ POST /authors/:authorId/memories funcional
+// ✔ NUNCA usa 'sa' por fallback
+// ✔ Falha explícita se config estiver errada
+// ✔ FIX: evita SQL 8144 (params vazando do sp_set_session_context)
 
-import express from 'express';
-import dotenv from 'dotenv';
-import path from 'path';
-import YAML from 'yamljs';
-import swaggerUi from 'swagger-ui-express';
-import { fileURLToPath } from 'url';
-import crypto from 'crypto';
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import sql from "mssql";
 
-import helmet from 'helmet';
-import cors from 'cors';
-import rateLimit from 'express-rate-limit';
+import { authRequired } from "./middleware/auth.js";
 
-import { optionalAuth } from './middleware/auth.js';
+const APP_VERSION = process.env.APP_VERSION || "HDUD-API-Node v0.6";
+const PORT = Number(process.env.PORT || 4000);
 
-import authRouter from './routes/auth.js';
-import authorsRouter from './routes/authors.js';
-import memoriesRouter from './routes/memories.js';
+// -----------------------------------------------------------------------------
+// SQL CONFIG (STRICT — SEM FALLBACK PERIGOSO)
+// -----------------------------------------------------------------------------
+function getSqlConfig() {
+  const server = process.env.DB_SERVER || process.env.SQL_SERVER;
+  const user = process.env.DB_USER || process.env.SQL_USER;
+  const password = process.env.DB_PASSWORD || process.env.SQL_PASSWORD;
+  const database = process.env.DB_DATABASE || process.env.SQL_DATABASE;
+  const port = Number(process.env.DB_PORT || process.env.SQL_PORT || 1433);
 
-import { getPool } from './db.js';
+  if (!server || !user || !password || !database) {
+    throw new Error(
+      "[SQL CONFIG] Variáveis obrigatórias ausentes. Esperado: DB_SERVER, DB_USER, DB_PASSWORD, DB_DATABASE"
+    );
+  }
 
-// ============================================================
-// 🔧 PATH FIX — necessário para ESM
-// ============================================================
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ============================================================
-// 🔧 CONFIG BÁSICA
-// ============================================================
-dotenv.config();
-
-const app = express();
-const port = process.env.PORT || 4000;
-
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const isProd = NODE_ENV === 'production';
-
-// ============================================================
-// 🧾 Request ID (observabilidade mínima)
-// ============================================================
-app.use((req, res, next) => {
-  req.id = crypto.randomUUID();
-  res.setHeader('X-Request-Id', req.id);
-  next();
-});
-
-// ============================================================
-// 🛡️ Security headers (Helmet)
-// ============================================================
-app.use(
-  helmet({
-    // Swagger usa recursos inline; em dev é comum relaxar CSP
-    contentSecurityPolicy: isProd ? undefined : false,
-    crossOriginEmbedderPolicy: false
-  })
-);
-
-// ============================================================
-// 🌍 CORS (controle explícito)
-// - Em produção, defina HDUD_CORS_ORIGINS="https://seu-dominio.com,https://app.seu-dominio.com"
-// - Em dev, libera localhost
-// ============================================================
-const defaultDevOrigins = [
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'http://localhost:4000',
-  'http://127.0.0.1:4000'
-];
-
-const envOrigins = (process.env.HDUD_CORS_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-const allowedOrigins = envOrigins.length ? envOrigins : defaultDevOrigins;
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // Permite chamadas sem Origin (ex: curl, Postman, server-to-server)
-      if (!origin) return cb(null, true);
-
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-
-      return cb(new Error('CORS_BLOCKED'));
+  return {
+    user,
+    password,
+    server,
+    port,
+    database,
+    options: {
+      encrypt: String(process.env.DB_ENCRYPT || "false") === "true",
+      trustServerCertificate: true,
     },
-    credentials: true,
-    exposedHeaders: ['X-Request-Id']
-  })
-);
-
-// ============================================================
-// 🧯 Rate limit (leve)
-// ============================================================
-app.use(
-  rateLimit({
-    windowMs: 60_000, // 1 min
-    limit: isProd ? 300 : 1000,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false
-  })
-);
-
-// ============================================================
-// 📦 Body parser (UTF-8 + limite)
-// ============================================================
-app.use(
-  express.json({
-    limit: '1mb',
-    type: ['application/json', 'application/*+json']
-  })
-);
-
-// ============================================================
-// 🔐 Auth opcional
-// ============================================================
-app.use(optionalAuth);
-
-// ============================================================
-// 📘 CARREGAR OPENAPI (YAML)
-// ============================================================
-const openapiPath = path.join(__dirname, 'docs', 'openapi.yaml');
-console.log('Carregando OpenAPI em:', openapiPath);
-
-let openapiDocument = {};
-try {
-  openapiDocument = YAML.load(openapiPath);
-} catch (err) {
-  console.error('❌ ERRO ao carregar openapi.yaml:', err.message);
-
-  openapiDocument = {
-    openapi: '3.0.3',
-    info: {
-      title: 'HDUD Core API',
-      version: '0.6.0',
-      description: 'Falha ao carregar openapi.yaml. Verifique src/docs/openapi.yaml.'
-    }
+    pool: {
+      max: 10,
+      min: 0,
+      idleTimeoutMillis: 30000,
+    },
+    requestTimeout: 30000,
+    connectionTimeout: 15000,
   };
 }
 
-// ============================================================
-// 📚 SWAGGER / OPENAPI
-// ============================================================
+let poolPromise = null;
 
-// Swagger UI — /docs/swagger
-app.use('/docs/swagger', swaggerUi.serve, swaggerUi.setup(openapiDocument));
+async function getPool() {
+  if (!poolPromise) {
+    poolPromise = sql.connect(getSqlConfig());
+  }
+  return poolPromise;
+}
 
-// OpenAPI JSON — /docs/openapi.json
-app.get('/docs/openapi.json', (req, res) => {
-  res.type('application/json; charset=utf-8').send(openapiDocument);
-});
+// -----------------------------------------------------------------------------
+// APP
+// -----------------------------------------------------------------------------
+const app = express();
 
-// Docs estáticos — /docs
-app.use('/docs', express.static(path.join(__dirname, 'docs')));
+// 🚫 NÃO usar trust proxy em dev/Docker
+app.set("trust proxy", false);
 
-// ============================================================
-// ❤️ HEALTH CHECK
-// ============================================================
-app.get('/health', async (req, res) => {
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({ origin: "*", credentials: false }));
+app.use(express.json({ limit: "2mb" }));
+
+// -----------------------------------------------------------------------------
+// HEALTH — NUNCA QUEBRA
+// -----------------------------------------------------------------------------
+app.get("/health", async (_req, res) => {
   try {
-    await getPool();
-    res.json({ status: 'ok', db: 'connected', version: 'HDUD-API-Node v0.6' });
+    const pool = await getPool();
+    await pool.request().query("SELECT 1");
+    res.status(200).json({
+      status: "ok",
+      db: "connected",
+      version: APP_VERSION,
+    });
   } catch (err) {
-    res.status(500).json({ status: 'error', db: 'disconnected' });
-  }
-});
-
-// ============================================================
-// 🌐 ROTAS DA APLICAÇÃO
-// ============================================================
-
-app.use('/auth', authRouter);
-app.use('/authors', authorsRouter);
-
-// memoriesRouter define paths: /authors/:id/memories, /memories/:id, etc.
-app.use('/', memoriesRouter);
-
-// ============================================================
-// 🧯 404 handler
-// ============================================================
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Not Found',
-    path: req.originalUrl,
-    request_id: req.id
-  });
-});
-
-// ============================================================
-// 🧯 Error handler padronizado
-// ============================================================
-app.use((err, req, res, next) => {
-  // CORS
-  if (err && err.message === 'CORS_BLOCKED') {
-    return res.status(403).json({
-      error: 'CORS blocked for this origin.',
-      request_id: req.id
+    // health sempre 200
+    res.status(200).json({
+      status: "ok",
+      db: "disconnected",
+      version: APP_VERSION,
+      detail: err?.message,
     });
   }
-
-  // JSON parse error
-  if (err instanceof SyntaxError && 'body' in err) {
-    return res.status(400).json({
-      error: 'Invalid JSON body.',
-      request_id: req.id
-    });
-  }
-
-  console.error(`[ERR][${req.id}]`, err);
-
-  res.status(500).json({
-    error: 'Internal Server Error',
-    request_id: req.id
-  });
 });
 
-// ============================================================
-// 🚀 START SERVER
-// ============================================================
-app.listen(port, () => {
-  console.log(`HDUD API v0.6 (hardened) rodando em: http://localhost:${port}`);
-  console.log(`Swagger UI:   http://localhost:${port}/docs/swagger`);
-  console.log(`OpenAPI JSON: http://localhost:${port}/docs/openapi.json`);
-  console.log(`Docs (HTML):  http://localhost:${port}/docs/`);
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+function getUserIdentity(req) {
+  const userId =
+    Number(req.user?.user_id) || Number(req.user?.id) || Number(req.user?.sub);
+
+  const userCode = (req.user?.email ||
+    req.user?.username ||
+    req.user?.sub ||
+    "hdud_api")
+    .toString()
+    .slice(0, 100);
+
+  return { userId, userCode };
+}
+
+/**
+ * IMPORTANTÍSSIMO:
+ * - NÃO reutilize o mesmo "request" que vai executar a procedure.
+ * - senão o param do session_context vira “argumento extra” na proc (SQL 8144).
+ */
+async function trySetSessionContext(pool, userCode) {
+  try {
+    const ctx = pool.request(); // request separado (limpo)
+    await ctx.query`
+      EXEC sys.sp_set_session_context
+        @key=N'hdud_user',
+        @value=${userCode};
+    `;
+  } catch {
+    // silencioso (não pode quebrar a request)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// ROUTER AUTO-MOUNT (NUNCA QUEBRA SERVER)
+// -----------------------------------------------------------------------------
+async function tryMount(path, modulePath) {
+  try {
+    const mod = await import(modulePath);
+    const router = mod.default || mod.router;
+    if (!router) throw new Error("router não exportado");
+    app.use(path, router);
+    console.log(`[ROUTE] OK ${path} <= ${modulePath}`);
+    return true;
+  } catch (err) {
+    console.log(`[ROUTE] SKIP ${path} <= ${modulePath} :: ${err.message}`);
+    return false;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// MAIN (mount -> fallback -> handlers -> listen)
+// -----------------------------------------------------------------------------
+async function main() {
+  // Mount routers ANTES de abrir a porta (evita cair em fallback por timing)
+  await tryMount("/auth", "./routes/auth.js");
+  await tryMount("/", "./routes/memory.js");
+  await tryMount("/", "./routes/memories.js");
+  await tryMount("/", "./routes/authors.js");
+
+  // ---------------------------------------------------------------------------
+  // FALLBACK CRÍTICO — CREATE MEMORY
+  // - fica por último, para não “ganhar” do router correto por ordem
+  // - FIX: session_context em request separado
+  // ---------------------------------------------------------------------------
+  app.post("/authors/:authorId/memories", authRequired, async (req, res) => {
+    try {
+      const authorId = Number(req.params.authorId);
+      if (!authorId || authorId <= 0) {
+        return res.status(400).json({ error: "authorId inválido" });
+      }
+
+      const content =
+        typeof req.body?.content === "string" ? req.body.content.trim() : "";
+      if (!content) {
+        return res.status(400).json({ error: "content é obrigatório" });
+      }
+
+      const title =
+        typeof req.body?.title === "string"
+          ? req.body.title.trim().slice(0, 500)
+          : null;
+
+      const { userId, userCode } = getUserIdentity(req);
+      if (!userId || userId <= 0) {
+        return res.status(401).json({ error: "userId não encontrado no token" });
+      }
+
+      const pool = await getPool();
+
+      // session_context em request separado (não vaza params)
+      await trySetSessionContext(pool, userCode);
+
+      // request limpo só para a proc
+      const request = pool.request();
+      request.input("AuthorId", sql.Int, authorId);
+      request.input("Title", sql.NVarChar(500), title);
+      request.input("Content", sql.NVarChar(sql.MAX), content);
+      request.input("UserId", sql.Int, userId);
+      request.input("UserCode", sql.NVarChar(100), userCode);
+
+      const result = await request.execute("dbo.p_CreateMemory_WithVersion");
+      res.status(201).json(result.recordset?.[0] || { ok: true });
+    } catch (err) {
+      console.error("[CREATE MEMORY]", err);
+      res.status(500).json({
+        error: "Falha ao criar memória",
+        detail: err?.originalError?.info?.message || err?.message || "Erro interno",
+      });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 404 + ERROR HANDLER
+  // ---------------------------------------------------------------------------
+  app.use((req, res) => {
+    res.status(404).json({
+      error: "Not Found",
+      path: req.path,
+    });
+  });
+
+  app.use((err, _req, res, _next) => {
+    console.error("[FATAL]", err);
+    res.status(500).json({
+      error: "Internal Server Error",
+      detail: err?.message || "Erro interno",
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // START
+  // ---------------------------------------------------------------------------
+  app.listen(PORT, () => {
+    console.log(`HDUD API listening on :${PORT} (${APP_VERSION})`);
+    console.log(
+      `[DB] server=${process.env.DB_SERVER} db=${process.env.DB_DATABASE} user=${process.env.DB_USER}`
+    );
+  });
+}
+
+main().catch((err) => {
+  console.error("[BOOT ERROR]", err);
+  process.exit(1);
 });

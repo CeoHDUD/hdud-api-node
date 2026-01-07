@@ -1,369 +1,116 @@
-// authors.js — HDUD API v0.5
+// C:\HDUD_DATA\hdud-api-node\src\routes\authors.js
+// HDUD API Node v0.6 — Authors routes
+// Montado em: app.use("/authors", authorsRoutes)
+// Portanto aqui as rotas NÃO começam com "/authors" de novo.
 
-import { Router } from 'express';
-import { getPool, sql } from '../db.js';
-import { getAuditContext } from '../utils/audit.js';
+import express from "express";
+import sql from "mssql";
 
-const router = Router();
+import { getPool } from "../db.js";
+import { authRequired } from "../middleware/auth.js";
 
-/**
- * GET /authors
- * Lista todos os autores cadastrados.
- * (Montado como GET /authors porque o server usa: app.use('/authors', authorsRouter))
- */
-router.get('/', async (req, res) => {
-  try {
-    const pool = await getPool();
-    const result = await pool.request()
-      .query(`
-        SELECT
-          author_id,
-          author_code,
-          full_name,
-          created_at
-        FROM dbo.identity_author
-        ORDER BY created_at DESC, author_id DESC;
-      `);
-
-    res.json(result.recordset);
-  } catch (err) {
-    console.error('[GET /authors] Erro SQL:', err);
-    res.status(500).json({ error: 'Erro ao listar autores.' });
-  }
-});
+const router = express.Router();
 
 /**
- * GET /authors/:id
- * Retorna os dados de um autor específico.
+ * Helper: extrai userId e userCode do req.user (JWT)
+ * Ajuste se o seu payload tiver campos diferentes.
  */
-router.get('/:id', async (req, res) => {
-  const authorId = parseInt(req.params.id, 10);
+function getUserIdentity(req) {
+  const rawId = req.user?.user_id ?? req.user?.id ?? req.user?.sub;
+  const userId = Number(rawId);
 
-  if (Number.isNaN(authorId)) {
-    return res.status(400).json({ error: 'authorId inválido.' });
-  }
+  const userCode =
+    (req.user?.email ??
+      req.user?.user_code ??
+      req.user?.username ??
+      (typeof req.user?.sub === "string" ? req.user.sub : null) ??
+      "hdud_api_v0.6")
+      .toString()
+      .slice(0, 100);
 
+  return { userId, userCode };
+}
+
+/**
+ * POST /authors/:authorId/memories
+ * Body: { title?: string, content: string }
+ *
+ * SQL:
+ * dbo.p_CreateMemory_WithVersion(
+ *   @AuthorId INT,
+ *   @Title NVARCHAR(500),
+ *   @Content NVARCHAR(MAX),
+ *   @UserId INT,
+ *   @UserCode NVARCHAR(100) = NULL
+ * )
+ */
+router.post("/:authorId/memories", authRequired, async (req, res) => {
   try {
-    const pool = await getPool();
-    const result = await pool.request()
-      .input('author_id', sql.Int, authorId)
-      .query(`
-        SELECT
-          author_id,
-          author_code,
-          full_name,
-          created_at
-        FROM dbo.identity_author
-        WHERE author_id = @author_id;
-      `);
+    const authorId = Number(req.params.authorId);
+    const { title: titleRaw = null, content: contentRaw = null } = req.body ?? {};
 
-    if (result.recordset.length === 0) {
-      return res.status(404).json({ error: 'Autor não encontrado.' });
+    if (!Number.isInteger(authorId) || authorId <= 0) {
+      return res.status(400).json({ error: "authorId inválido" });
     }
 
-    res.json(result.recordset[0]);
-  } catch (err) {
-    console.error('[GET /authors/:id] Erro SQL:', err);
-    res.status(500).json({ error: 'Erro ao obter autor.' });
-  }
-});
+    const content = typeof contentRaw === "string" ? contentRaw.trim() : "";
+    if (!content) {
+      return res.status(400).json({ error: "content é obrigatório" });
+    }
 
-/**
- * POST /authors
- * Cria um novo autor.
- * Body:
- * {
- *   "author_code": "ALE-0001",
- *   "full_name": "Alexandre Neves"
- * }
- */
-router.post('/', async (req, res) => {
-  const { author_code, full_name } = req.body;
+    let title = null;
+    if (typeof titleRaw === "string") {
+      const t = titleRaw.trim();
+      title = t.length ? t.slice(0, 500) : null;
+    }
 
-  if (!author_code || !full_name) {
-    return res.status(400).json({
-      error: 'Campos obrigatórios: author_code, full_name.'
-    });
-  }
-
-  try {
-    const pool = await getPool();
-
-    // 0) Contexto de auditoria (SYSTEM / USER / AUTHOR)
-    const audit = getAuditContext(req);
-
-    // 1) Verifica se já existe autor com o mesmo código
-    const existsResult = await pool.request()
-      .input('author_code', sql.VarChar(50), author_code)
-      .query(`
-        SELECT TOP 1 author_id
-        FROM dbo.identity_author
-        WHERE author_code = @author_code;
-      `);
-
-    if (existsResult.recordset.length > 0) {
-      return res.status(409).json({
-        error: 'Já existe um autor com este author_code.'
+    const { userId, userCode } = getUserIdentity(req);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(401).json({
+        error:
+          "Token autenticado, mas userId não encontrado no req.user (esperado: user_id ou id).",
       });
     }
 
-    // 2) Insere o autor
-    const insertResult = await pool.request()
-      .input('author_code', sql.VarChar(50), author_code)
-      .input('full_name', sql.NVarChar(200), full_name)
-      .query(`
-        INSERT INTO dbo.identity_author (author_code, full_name)
-        OUTPUT INSERTED.author_id,
-               INSERTED.author_code,
-               INSERTED.full_name,
-               INSERTED.created_at
-        VALUES (@author_code, @full_name);
-      `);
-
-    const author = insertResult.recordset[0];
-
-    // 3) Registra AUTHOR_CREATED no ledger
-    const payload = {
-      author_id: author.author_id,
-      author_code: author.author_code,
-      full_name: author.full_name,
-      created_at: author.created_at
-    };
-
-    try {
-      await pool.request()
-        .input('event_type', sql.VarChar(50), 'AUTHOR_CREATED')
-        .input('entity_type', sql.VarChar(50), 'AUTHOR')
-        .input('entity_id', sql.BigInt, author.author_id)
-        .input('version_number', sql.Int, 1)
-        .input('payload_json', sql.NVarChar(sql.MAX), JSON.stringify(payload))
-        .input('created_by', sql.VarChar(100), audit.created_by)
-        .input('created_by_user_id', sql.BigInt, audit.created_by_user_id)
-        .input('created_by_author_id', sql.BigInt, audit.created_by_author_id)
-        .execute('dbo.p_RegisterIdentityEvent');
-    } catch (ledgerErr) {
-      console.error('[LEDGER] Erro ao registrar AUTHOR_CREATED:', ledgerErr);
-      // não falha a criação do autor se só o ledger deu erro
-    }
-
-    res.status(201).json(author);
-  } catch (err) {
-    console.error('[POST /authors] Erro SQL:', err);
-    res.status(500).json({ error: 'Erro ao criar autor.' });
-  }
-});
-
-/**
- * PUT /authors/:id
- * Atualiza dados básicos do autor (hoje, apenas full_name).
- * Body:
- * {
- *   "full_name": "Novo nome"
- * }
- */
-router.put('/:id', async (req, res) => {
-  const authorId = parseInt(req.params.id, 10);
-  const { full_name } = req.body;
-
-  if (Number.isNaN(authorId)) {
-    return res.status(400).json({ error: 'authorId inválido.' });
-  }
-
-  if (!full_name) {
-    return res.status(400).json({
-      error: 'Campo obrigatório: full_name.'
-    });
-  }
-
-  try {
+    // ✅ Reuso de pool (padrão do projeto v0.6)
     const pool = await getPool();
+    const request = pool.request();
 
-    // 0) Contexto de auditoria
-    const audit = getAuditContext(req);
+    // Session context (mesma request)
+    request.input("hdud_user", sql.NVarChar(100), userCode);
+    await request.query(
+      "EXEC sys.sp_set_session_context @key=N'hdud_user', @value=@hdud_user;"
+    );
 
-    // 1) Busca o autor atual
-    const currentResult = await pool.request()
-      .input('author_id', sql.Int, authorId)
-      .query(`
-        SELECT
-          author_id,
-          author_code,
-          full_name,
-          created_at
-        FROM dbo.identity_author
-        WHERE author_id = @author_id;
-      `);
+    // Inputs EXACTOS exigidos pela procedure
+    request.input("AuthorId", sql.Int, authorId);
+    request.input("Title", sql.NVarChar(500), title);
+    request.input("Content", sql.NVarChar(sql.MAX), content);
+    request.input("UserId", sql.Int, userId);
+    request.input("UserCode", sql.NVarChar(100), userCode);
 
-    if (currentResult.recordset.length === 0) {
-      return res.status(404).json({ error: 'Autor não encontrado.' });
-    }
+    const result = await request.execute("dbo.p_CreateMemory_WithVersion");
+    const row = result.recordset?.[0];
 
-    const current = currentResult.recordset[0];
+    // Se não retornar nada, ainda é sucesso.
+    if (!row) return res.status(201).json({ ok: true });
 
-    // Se o nome não mudou, pode só retornar o atual
-    if (current.full_name === full_name) {
-      return res.json(current);
-    }
-
-    // 2) Atualiza o autor
-    const updateResult = await pool.request()
-      .input('author_id', sql.Int, authorId)
-      .input('full_name', sql.NVarChar(200), full_name)
-      .query(`
-        UPDATE dbo.identity_author
-        SET full_name = @full_name
-        OUTPUT INSERTED.author_id,
-               INSERTED.author_code,
-               INSERTED.full_name,
-               INSERTED.created_at
-        WHERE author_id = @author_id;
-      `);
-
-    const updated = updateResult.recordset[0];
-
-    // 3) Calcula próximo version_number no ledger para este autor
-    const versionResult = await pool.request()
-      .input('entity_type', sql.VarChar(50), 'AUTHOR')
-      .input('entity_id', sql.BigInt, authorId)
-      .query(`
-        SELECT ISNULL(MAX(version_number), 1) AS last_version
-        FROM dbo.identity_ledger
-        WHERE entity_type = @entity_type
-          AND entity_id   = @entity_id;
-      `);
-
-    const lastVersion = versionResult.recordset[0]?.last_version || 1;
-    const nextVersion = lastVersion + 1;
-
-    // 4) Registra AUTHOR_UPDATED no ledger
-    const payload = {
-      before: current,
-      after: updated
-    };
-
-    try {
-      await pool.request()
-        .input('event_type', sql.VarChar(50), 'AUTHOR_UPDATED')
-        .input('entity_type', sql.VarChar(50), 'AUTHOR')
-        .input('entity_id', sql.BigInt, authorId)
-        .input('version_number', sql.Int, nextVersion)
-        .input('payload_json', sql.NVarChar(sql.MAX), JSON.stringify(payload))
-        .input('created_by', sql.VarChar(100), audit.created_by)
-        .input('created_by_user_id', sql.BigInt, audit.created_by_user_id)
-        .input('created_by_author_id', sql.BigInt, audit.created_by_author_id)
-        .execute('dbo.p_RegisterIdentityEvent');
-    } catch (ledgerErr) {
-      console.error('[LEDGER] Erro ao registrar AUTHOR_UPDATED:', ledgerErr);
-      // não falha a atualização do autor se só o ledger deu erro
-    }
-
-    res.json(updated);
+    return res.status(201).json(row);
   } catch (err) {
-    console.error('[PUT /authors/:id] Erro SQL:', err);
-    res.status(500).json({ error: 'Erro ao atualizar autor.' });
-  }
-});
+    console.error("[POST /authors/:authorId/memories] erro:", err);
 
-/**
- * GET /authors/:id/timeline
- * Linha do tempo de eventos de um autor no identity_ledger.
- */
-router.get('/:id/timeline', async (req, res) => {
-  const authorId = parseInt(req.params.id, 10);
+    const detail =
+      err?.originalError?.info?.message || err?.message || "Erro interno";
 
-  if (Number.isNaN(authorId)) {
-    return res.status(400).json({ error: 'authorId inválido.' });
-  }
+    // Se for erro de validação do SQL (ex: param faltando), devolve 400
+    // Senão, 500.
+    const isSqlParamError =
+      (err?.number === 201 || detail?.includes("expects parameter")) ?? false;
 
-  try {
-    const pool = await getPool();
-
-    const result = await pool.request()
-      .input('entity_id', sql.BigInt, authorId)
-      .query(`
-        SELECT
-          ledger_id,
-          event_type,
-          entity_type,
-          entity_id,
-          version_number,
-          payload_json,
-          created_at,
-          created_by
-        FROM dbo.identity_ledger
-        WHERE entity_type = 'AUTHOR'
-          AND entity_id   = @entity_id
-        ORDER BY version_number ASC, created_at ASC, ledger_id ASC;
-      `);
-
-    const timeline = result.recordset.map(row => {
-      let payload = null;
-      try {
-        payload = JSON.parse(row.payload_json);
-      } catch (e) {
-        payload = null;
-      }
-
-      if (row.event_type === 'AUTHOR_CREATED' && payload) {
-        return {
-          ledger_id: row.ledger_id,
-          version: row.version_number,
-          event: row.event_type,
-          timestamp: row.created_at,
-          created_by: row.created_by,
-          author_id: row.entity_id,
-          author_code: payload.author_code,
-          full_name: payload.full_name
-        };
-      }
-
-      if (row.event_type === 'AUTHOR_UPDATED' && payload) {
-        const before = payload.before || null;
-        const after  = payload.after  || null;
-
-        const changed_fields = [];
-        if (before && after) {
-          for (const key of Object.keys(after)) {
-            if (
-              Object.prototype.hasOwnProperty.call(before, key) &&
-              before[key] !== after[key]
-            ) {
-              changed_fields.push(key);
-            }
-          }
-        }
-
-        return {
-          ledger_id: row.ledger_id,
-          version: row.version_number,
-          event: row.event_type,
-          timestamp: row.created_at,
-          created_by: row.created_by,
-          before,
-          after,
-          changed_fields
-        };
-      }
-
-      // fallback genérico
-      return {
-        ledger_id: row.ledger_id,
-        version: row.version_number,
-        event: row.event_type,
-        timestamp: row.created_at,
-        created_by: row.created_by,
-        payload
-      };
+    return res.status(isSqlParamError ? 400 : 500).json({
+      error: "Falha ao criar memória",
+      detail,
     });
-
-    res.json({
-      author_id: authorId,
-      total_events: timeline.length,
-      timeline
-    });
-  } catch (err) {
-    console.error('[GET /authors/:id/timeline] Erro SQL:', err);
-    res.status(500).json({ error: 'Erro ao obter timeline do autor.' });
   }
 });
 

@@ -1,23 +1,26 @@
-// src/utils/audit.js
-
-// Vamos centralizar a lógica de "quem está criando o evento".
 export function getAuditContext(req) {
-  const API_TAG = 'hdud_api_v0.1';
-  const SYSTEM_USER_ID = 2; // SYSTEM_KERNEL
+  // headers opcionais (se você usar no futuro)
+  const created_by =
+    req.headers['x-user-code'] ||
+    req.headers['x-created-by'] ||
+    req.user?.email ||
+    'unknown';
 
-  // Se veio token válido
-  if (req?.auth?.isAuthenticated) {
-    return {
-      created_by: API_TAG,
-      created_by_user_id: req.auth.userId ?? SYSTEM_USER_ID,
-      created_by_author_id: req.auth.authorId ?? null,
-    };
-  }
+  const created_by_user_id =
+    req.user?.sub ??
+    req.user?.user_id ??
+    req.user?.id ??
+    null;
 
-  // Anônimo / sem token → SYSTEM_KERNEL
+  const created_by_author_id =
+    req.user?.author_id ??
+    req.user?.authorId ??
+    req.user?.author ??
+    null;
+
   return {
-    created_by: API_TAG,
-    created_by_user_id: SYSTEM_USER_ID,
-    created_by_author_id: null,
+    created_by: String(created_by),
+    created_by_user_id: created_by_user_id != null ? Number(created_by_user_id) : null,
+    created_by_author_id: created_by_author_id != null ? Number(created_by_author_id) : null
   };
 }
