@@ -1,28 +1,12 @@
-# Normalize line endings automatically
+# Normalize line endings
 * text=auto
 
-# Explicit text files
-*.js     text
-*.mjs    text
-*.json   text
-*.yaml   text
-*.yml    text
-*.md     text
-*.sql    text
-*.ps1    text
-
-# Force LF for scripts (best practice)
-*.sh     text eol=lf
-*.yaml   text eol=lf
-*.yml    text eol=lf
-
-# PowerShell stays CRLF on Windows
-*.ps1    text eol=crlf
-
-# Binary files
-*.png    binary
-*.jpg    binary
-*.jpeg   binary
-*.gif    binary
-*.ico    binary
-*.pdf    binary
+# Force LF for source files
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.sql  text eol=lf
