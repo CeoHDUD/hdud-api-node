@@ -1,4 +1,4 @@
-// routes/auth.js — HDUD API Core v0.6
+// C:\HDUD_DATA\hdud-api-node\src\routes\auth.js
 // login + refresh token + logout + author_id + /auth/me + rate limit em login/signup
 
 import { Router } from 'express';

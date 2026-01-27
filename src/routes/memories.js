@@ -1,4 +1,4 @@
-﻿// src/routes/memories.js — HDUD API v0.6 (stable)
+﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js 
 // - GET  /authors/:authorId/memories
 // - POST /authors/:authorId/memories        -> dbo.p_CreateMemory_WithVersion (5 params)
 // - GET  /memories/:id

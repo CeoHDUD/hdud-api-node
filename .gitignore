@@ -11,3 +11,7 @@ coverage/
 
 # local artifacts
 freeze/
+.vite/
+.pnpm-store/
+.cache/
+Thumbs.db

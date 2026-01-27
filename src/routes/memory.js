@@ -1,4 +1,4 @@
-﻿// src/routes/memory.js — HDUD API v0.6 (fixed)
+﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memory.js 
 // Contrato estável:
 //   POST /memory
 //   PUT  /memory/:id
