@@ -1,9 +1,11 @@
-﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js 
+﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js
+// Rotas deste arquivo:
+// - POST /memories                      -> (contrato) payload { content: string }
 // - GET  /authors/:authorId/memories
-// - POST /authors/:authorId/memories        -> dbo.p_CreateMemory_WithVersion (5 params)
+// - POST /authors/:authorId/memories     -> dbo.p_CreateMemory_WithVersion (5 params)
 // - GET  /memories/:id
 // - GET  /memories/:id/versions
-// - PUT  /memories/:id                      -> dbo.p_UpdateMemory_WithVersion (6 params)
+// - PUT  /memories/:id                   -> dbo.p_UpdateMemory_WithVersion (6 params)
 
 import express from "express";
 import { authenticate } from "../middleware/auth.js";
@@ -77,6 +79,80 @@ async function trySetSessionContext(pool, userCode) {
   }
 }
 
+function hasOnlyAllowedKeys(obj, allowedKeys) {
+  const keys = Object.keys(obj || {});
+  for (const k of keys) {
+    if (!allowedKeys.includes(k)) return false;
+  }
+  return true;
+}
+
+// -----------------------------------------------------------------------------
+// POST /memories  (CONTRATO)
+// Body: { content: "string" }
+// - 422: payload inválido
+// - 400: violação de contrato
+// - 403: autoria inválida
+// -----------------------------------------------------------------------------
+router.post("/memories", authenticate, async (req, res) => {
+  try {
+    const body = req.body;
+
+    // payload deve ser objeto JSON
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return res.status(422).json({ error: "Payload inválido." });
+    }
+
+    // contrato: payload conceitual contém apenas "content"
+    if (!hasOnlyAllowedKeys(body, ["content"])) {
+      return res.status(400).json({ error: "Violação de contrato." });
+    }
+
+    const content =
+      typeof body?.content === "string" ? body.content.trim() : "";
+
+    if (!content) {
+      return res.status(422).json({ error: "Payload inválido." });
+    }
+
+    const authorId = Number(req.user?.author_id);
+    if (!Number.isInteger(authorId) || authorId <= 0) {
+      return res.status(403).json({ error: "Autoria inválida." });
+    }
+
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(403).json({ error: "Autoria inválida." });
+    }
+
+    const userCode = getUserCode(req);
+
+    const pool = await getPool();
+    await trySetSessionContext(pool, userCode);
+
+    // request LIMPO para a proc
+    const request = pool.request();
+    request.input("AuthorId", sql.Int, authorId);
+    request.input("Title", sql.NVarChar(500), null);
+    request.input("Content", sql.NVarChar(sql.MAX), content);
+    request.input("UserId", sql.Int, userId);
+    request.input("UserCode", sql.NVarChar(100), userCode);
+
+    const result = await request.execute("dbo.p_CreateMemory_WithVersion");
+    const row = result?.recordset?.[0];
+
+    if (!row) return res.status(500).json({ error: "Erro ao criar memória." });
+
+    return res.status(201).json(attachMeta(row, req, authorId));
+  } catch (err) {
+    console.error("[POST /memories] erro:", err);
+    return res.status(500).json({
+      error: "Erro ao criar memória.",
+      detail: err?.originalError?.info?.message || err?.message,
+    });
+  }
+});
+
 // -----------------------------------------------------------------------------
 // GET /authors/:authorId/memories
 // -----------------------------------------------------------------------------
@@ -109,7 +185,9 @@ router.get("/authors/:authorId/memories", authenticate, async (req, res) => {
         ORDER BY created_at DESC, memory_id DESC;
       `);
 
-    const rows = (result.recordset || []).map((r) => attachMeta(r, req, authorId));
+    const rows = (result.recordset || []).map((r) =>
+      attachMeta(r, req, authorId)
+    );
     return res.json({ author_id: authorId, memories: rows });
   } catch (err) {
     console.error("[GET /authors/:authorId/memories] erro:", err);
@@ -176,23 +254,22 @@ router.post("/authors/:authorId/memories", authenticate, async (req, res) => {
 
 // -----------------------------------------------------------------------------
 // GET /memories/:id
+// (ajustado para aderir aos "Erros Fechados" do contrato v1.0)
 // -----------------------------------------------------------------------------
-router.get(
-  "/memories/:id",
-  authenticate,
-  requireMemoryOwnership({ paramName: "id" }),
-  async (req, res) => {
-    try {
-      const memoryId = Number(req.params.id);
-      if (!Number.isInteger(memoryId) || memoryId <= 0) {
-        return res.status(400).json({ error: "id inválido." });
-      }
+router.get("/memories/:id", authenticate, async (req, res) => {
+  try {
+    const memoryId = Number(req.params.id);
 
-      const pool = await getPool();
-      const result = await pool
-        .request()
-        .input("id", sql.Int, memoryId)
-        .query(`
+    // contrato: param inválido = violação de contrato (400)
+    if (!Number.isInteger(memoryId) || memoryId <= 0) {
+      return res.status(400).json({ error: "Violação de contrato." });
+    }
+
+    const pool = await getPool();
+    const result = await pool
+      .request()
+      .input("id", sql.Int, memoryId)
+      .query(`
           SELECT
             memory_id,
             author_id,
@@ -205,18 +282,24 @@ router.get(
           WHERE memory_id = @id;
         `);
 
-      const row = result.recordset?.[0];
-      if (!row || row.is_deleted) {
-        return res.status(404).json({ error: "Memória não encontrada." });
-      }
+    const row = result.recordset?.[0];
 
-      return res.json(attachMeta(row, req, row.author_id));
-    } catch (err) {
-      console.error("[GET /memories/:id] erro:", err);
-      return res.status(500).json({ error: "Erro ao carregar memória." });
+    // contrato: memória inexistente = 404 (inclui "apagada")
+    if (!row || row.is_deleted) {
+      return res.status(404).json({ error: "Memória inexistente." });
     }
+
+    // contrato: pertence a uma única identidade -> acesso só do dono (ou system/admin)
+    if (!canEditFromReq(req, row.author_id)) {
+      return res.status(403).json({ error: "Autoria inválida." });
+    }
+
+    return res.json(attachMeta(row, req, row.author_id));
+  } catch (err) {
+    console.error("[GET /memories/:id] erro:", err);
+    return res.status(500).json({ error: "Erro ao carregar memória." });
   }
-);
+});
 
 // -----------------------------------------------------------------------------
 // GET /memories/:id/versions

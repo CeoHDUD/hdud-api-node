@@ -32,6 +32,63 @@ function getUserIdentity(req) {
 }
 
 /**
+ * GET /authors/:authorId/memories
+ * - ownership: authorId do path DEVE ser o mesmo do token (req.user.author_id)
+ * - payload conforme contrato (conceitual): { "content": "string" }
+ * - sem paginação
+ * - sem ordenação customizada
+ *
+ * Response: Array<{ content: string }>
+ */
+router.get("/:authorId/memories", authRequired, async (req, res) => {
+  try {
+    const authorId = Number(req.params.authorId);
+    if (!Number.isInteger(authorId) || authorId <= 0) {
+      return res.status(400).json({ error: "authorId inválido" });
+    }
+
+    const tokenAuthorId = Number(req.user?.author_id);
+    if (!Number.isInteger(tokenAuthorId) || tokenAuthorId <= 0) {
+      return res.status(401).json({ error: "Contexto inválido." });
+    }
+
+    // Ownership (contrato: 403 = autoria inválida)
+    if (tokenAuthorId !== authorId) {
+      return res.status(403).json({ error: "Autoria inválida" });
+    }
+
+    const pool = await getPool();
+    const request = pool.request();
+
+    const r = await request
+      .input("author_id", sql.Int, authorId)
+      .query(`
+        SELECT content
+        FROM dbo.identity_memory
+        WHERE author_id = @author_id
+          AND is_deleted = 0
+      `);
+
+    // Payload conceitual do contrato: apenas "content"
+    const items = (r.recordset ?? []).map((row) => ({
+      content: row.content ?? "",
+    }));
+
+    return res.status(200).json(items);
+  } catch (err) {
+    console.error("[GET /authors/:authorId/memories] erro:", err);
+
+    const detail =
+      err?.originalError?.info?.message || err?.message || "Erro interno";
+
+    return res.status(500).json({
+      error: "Falha ao listar memórias",
+      detail,
+    });
+  }
+});
+
+/**
  * POST /authors/:authorId/memories
  * Body: { title?: string, content: string }
  *
