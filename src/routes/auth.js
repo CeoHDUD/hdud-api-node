@@ -19,7 +19,18 @@ import {
 const router = Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hdud_dev_secret';
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m';
+
+// ✅ DEV default mais longo para evitar retrabalho (mantém override via env)
+const DEFAULT_DEV_EXPIRES_IN = '24h';
+const DEFAULT_PROD_EXPIRES_IN = '15m';
+
+// Se JWT_EXPIRES_IN estiver definido no ambiente, respeita.
+// Se não estiver, usa 24h em DEV e 15m em produção.
+const JWT_EXPIRES_IN =
+  process.env.JWT_EXPIRES_IN ||
+  (process.env.NODE_ENV === 'production'
+    ? DEFAULT_PROD_EXPIRES_IN
+    : DEFAULT_DEV_EXPIRES_IN);
 
 /**
  * Gera um JWT simples com:

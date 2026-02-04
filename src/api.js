@@ -1,3 +1,5 @@
+// C:\HDUD_DATA\hdud-api-node\src\api.js
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:4000';
 
 function getTokens() {
