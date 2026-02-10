@@ -20,17 +20,37 @@ const router = Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hdud_dev_secret';
 
-// ✅ DEV default mais longo para evitar retrabalho (mantém override via env)
+// =======================
+// JWT TTL (controle de demo vs produção)
+// =======================
+//
+// Problema observado:
+// - Em container (Dockerfile.prod), geralmente NODE_ENV fica "production"
+// - Isso fazia o default cair em 15m e gerar "jwt expired" durante o fluxo.
+//
+// Solução (sem quebrar contrato):
+// 1) Se JWT_EXPIRES_IN estiver definido => respeita (sempre).
+// 2) Se NÃO estiver definido:
+//    - Por padrão: 24h (inclusive em production) para não atrapalhar o MVP/demo.
+//    - Se quiser comportamento estrito em produção: set JWT_STRICT_PROD=true
+//      => default volta para 15m.
+//
+// Resultado:
+// - MVP/Demo fica estável sem precisar re-login a cada pouco.
+// - Produção pode ser endurecida via ENV quando chegar a hora.
+//
 const DEFAULT_DEV_EXPIRES_IN = '24h';
-const DEFAULT_PROD_EXPIRES_IN = '15m';
+const DEFAULT_PROD_EXPIRES_IN = '24h'; // ✅ default "amigável" para demo
+const STRICT_PROD_EXPIRES_IN = '15m';
 
-// Se JWT_EXPIRES_IN estiver definido no ambiente, respeita.
-// Se não estiver, usa 24h em DEV e 15m em produção.
+const isStrictProd =
+  String(process.env.JWT_STRICT_PROD || 'false').toLowerCase() === 'true';
+
+const isProd = process.env.NODE_ENV === 'production';
+
 const JWT_EXPIRES_IN =
   process.env.JWT_EXPIRES_IN ||
-  (process.env.NODE_ENV === 'production'
-    ? DEFAULT_PROD_EXPIRES_IN
-    : DEFAULT_DEV_EXPIRES_IN);
+  (isProd ? (isStrictProd ? STRICT_PROD_EXPIRES_IN : DEFAULT_PROD_EXPIRES_IN) : DEFAULT_DEV_EXPIRES_IN);
 
 /**
  * Gera um JWT simples com:

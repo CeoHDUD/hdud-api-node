@@ -1,6 +1,7 @@
 ﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js
 // Rotas deste arquivo:
 // - POST /memories                      -> (contrato) payload { content: string }
+// - GET  /memories                      -> (alias) lista memórias do author do token (para /api/memories)
 // - GET  /authors/:authorId/memories
 // - POST /authors/:authorId/memories     -> dbo.p_CreateMemory_WithVersion
 // - GET  /memories/:id
@@ -188,6 +189,9 @@ async function updateMemoryPhase(pool, memoryId, authorId, phaseIdOrNull) {
 }
 
 // ✅ select com phase meta
+// ⚠️ IMPORTANTE: não usar LEFT JOIN direto em identity_memory_chapter,
+// porque múltiplas linhas por memory_id multiplicam o resultado (duplicidade).
+// Usamos OUTER APPLY TOP 1 para garantir 1 chapter_id por memória.
 async function selectMemoryById(pool, memoryId) {
   const r = await pool
     .request()
@@ -206,14 +210,62 @@ async function selectMemoryById(pool, memoryId) {
         m.version_number,
         m.is_deleted
       FROM dbo.identity_memory m
-      LEFT JOIN dbo.identity_memory_chapter mc
-        ON mc.memory_id = m.memory_id
+      OUTER APPLY (
+        SELECT TOP 1 chapter_id
+        FROM dbo.identity_memory_chapter
+        WHERE memory_id = m.memory_id
+        ORDER BY chapter_id ASC
+      ) mc
       LEFT JOIN dbo.identity_phase p
         ON p.phase_id = m.phase_id
       WHERE m.memory_id = @id;
     `);
 
   return r.recordset?.[0] ?? null;
+}
+
+async function listMemoriesByAuthor(pool, authorId, req) {
+  const result = await pool
+    .request()
+    .input("author_id", sql.Int, authorId)
+    .query(`
+      SELECT
+        m.memory_id,
+        m.author_id,
+        mc.chapter_id,
+        m.phase_id,
+        p.phase_code AS life_phase,
+        p.name       AS phase_name,
+        m.title,
+        m.content,
+        m.created_at,
+        m.version_number,
+        m.is_deleted
+      FROM dbo.identity_memory m
+      OUTER APPLY (
+        SELECT TOP 1 chapter_id
+        FROM dbo.identity_memory_chapter
+        WHERE memory_id = m.memory_id
+        ORDER BY chapter_id ASC
+      ) mc
+      LEFT JOIN dbo.identity_phase p
+        ON p.phase_id = m.phase_id
+      WHERE m.author_id = @author_id
+        AND ISNULL(m.is_deleted, 0) = 0
+      ORDER BY m.created_at DESC, m.memory_id DESC;
+    `);
+
+  // ✅ Dedupe defensivo por memory_id (caso o banco esteja “sujo”)
+  const seen = new Set();
+  const out = [];
+  for (const r of result.recordset || []) {
+    const id = r?.memory_id;
+    if (id == null) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(attachMeta(r, req, authorId));
+  }
+  return out;
 }
 
 // POST /memories (contrato mínimo)
@@ -268,6 +320,27 @@ router.post("/memories", authenticate, async (req, res) => {
   }
 });
 
+// ✅ GET /memories (alias para inventário e listas simples)
+// - quando montado em /api, vira /api/memories e elimina o 404 do frontend
+router.get("/memories", authenticate, async (req, res) => {
+  try {
+    const authorId = Number(req.user?.author_id);
+    if (!Number.isInteger(authorId) || authorId <= 0) {
+      return res.status(403).json({ error: "Autoria inválida." });
+    }
+    if (!canEditFromReq(req, authorId)) {
+      return res.status(403).json({ error: "Permissão negada." });
+    }
+
+    const pool = await getPool();
+    const rows = await listMemoriesByAuthor(pool, authorId, req);
+    return res.json({ author_id: authorId, memories: rows });
+  } catch (err) {
+    console.error("[GET /memories] erro:", err);
+    return res.status(500).json({ error: "Erro ao listar memórias." });
+  }
+});
+
 // GET /authors/:authorId/memories
 router.get("/authors/:authorId/memories", authenticate, async (req, res) => {
   try {
@@ -280,32 +353,7 @@ router.get("/authors/:authorId/memories", authenticate, async (req, res) => {
     }
 
     const pool = await getPool();
-    const result = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .query(`
-        SELECT
-          m.memory_id,
-          m.author_id,
-          mc.chapter_id,
-          m.phase_id,
-          p.phase_code AS life_phase,
-          p.name       AS phase_name,
-          m.title,
-          m.content,
-          m.created_at,
-          m.version_number,
-          m.is_deleted
-        FROM dbo.identity_memory m
-        LEFT JOIN dbo.identity_memory_chapter mc
-          ON mc.memory_id = m.memory_id
-        LEFT JOIN dbo.identity_phase p
-          ON p.phase_id = m.phase_id
-        WHERE m.author_id = @author_id
-        ORDER BY m.created_at DESC, m.memory_id DESC;
-      `);
-
-    const rows = (result.recordset || []).map((r) => attachMeta(r, req, authorId));
+    const rows = await listMemoriesByAuthor(pool, authorId, req);
     return res.json({ author_id: authorId, memories: rows });
   } catch (err) {
     console.error("[GET /authors/:authorId/memories] erro:", err);

@@ -1,4 +1,4 @@
-// src/middleware/auth.js
+// C:\HDUD_DATA\hdud-api-node\src\middleware\auth.js
 import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET || "hdud_dev_secret";
