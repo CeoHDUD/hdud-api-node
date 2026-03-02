@@ -53,6 +53,39 @@ async function apiFetch(path, { method = 'GET', body, headers = {} } = {}) {
   return parseResponse(res);
 }
 
+// ✅ multipart/form-data (upload)
+async function apiFetchForm(path, { method = 'POST', formData, headers = {} } = {}) {
+  const { access_token } = getTokens();
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      ...(access_token ? { Authorization: `Bearer ${access_token}` } : {}),
+      ...headers,
+    },
+    body: formData,
+  });
+
+  // Se token expirou, tenta refresh 1x
+  if (res.status === 401) {
+    const refreshed = await tryRefresh();
+    if (refreshed) {
+      const { access_token: newAccess } = getTokens();
+      const retry = await fetch(`${API_BASE}${path}`, {
+        method,
+        headers: {
+          ...(newAccess ? { Authorization: `Bearer ${newAccess}` } : {}),
+          ...headers,
+        },
+        body: formData,
+      });
+      return parseResponse(retry);
+    }
+  }
+
+  return parseResponse(res);
+}
+
 async function parseResponse(res) {
   const text = await res.text();
   let data = null;
@@ -122,4 +155,11 @@ export const api = {
 
   rollback: (memoryId, version) =>
     apiFetch(`/memories/${memoryId}/rollback/${version}`, { method: 'POST' }),
+
+  // ✅ Avatar Upload: POST /me/avatar (field "file")
+  uploadAvatar: (file) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return apiFetchForm('/me/avatar', { method: 'POST', formData: fd });
+  },
 };

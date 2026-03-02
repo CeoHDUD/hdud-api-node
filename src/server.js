@@ -2,11 +2,21 @@
 
 import express from "express";
 import cors from "cors";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
+import fsp from "fs/promises";
 
 let helmet = null;
 try {
   const mod = await import("helmet");
   helmet = mod?.default || null;
+} catch {}
+
+let multer = null;
+try {
+  const mod = await import("multer");
+  multer = mod?.default || null;
 } catch {}
 
 import authRouter from "./routes/auth.js";
@@ -46,24 +56,28 @@ function forceHeadersOnWriteHead(res, fn) {
 }
 
 // =======================
+// PUBLIC DIR (FIX DEFINITIVO DO /cdn)
+// =======================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// src/server.js -> ../public
+const PUBLIC_DIR = path.resolve(__dirname, "../public");
+
+// CDN local avatar dir (estrutura tipo S3 local)
+const AVATARS_DIR = path.join(PUBLIC_DIR, "avatars");
+
+// =======================
 // CORS (para chamadas fetch/XHR)
 // =======================
 app.use(cors({ origin: "*" }));
 
 // =======================
 // GARANTIA FINAL DE HEADERS PARA /cdn/*
-// (aplica no último instante antes de enviar headers)
 // =======================
 app.use((req, res, next) => {
   if (req.path.startsWith("/cdn")) {
     forceHeadersOnWriteHead(res, () => {
-      // precisa ser cross-origin (ou não existir)
       res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-
-      // opcional: não atrapalha imagens; remove se Helmet setar algo agressivo
-      // (não é o problema principal, mas deixa limpo)
-      // res.removeHeader("Cross-Origin-Opener-Policy");
-      // res.removeHeader("Cross-Origin-Embedder-Policy");
     });
   }
   next();
@@ -71,12 +85,10 @@ app.use((req, res, next) => {
 
 // =======================
 // Helmet (produção)
-// REGRA: NÃO aplicar em /cdn, senão o Chrome pode bloquear <img> cross-origin por CORP same-origin
 // =======================
 if (helmet) {
   const helmetMw = helmet({
     contentSecurityPolicy: false,
-    // não forçamos CORP global aqui; o /cdn garante o próprio header
   });
 
   app.use((req, res, next) => {
@@ -85,27 +97,7 @@ if (helmet) {
   });
 }
 
-// =======================
-// CDN LOCAL (MVP) — /cdn/*
-// Serve arquivos estáticos em /public
-// Ex.: /public/avatars/author_1.jpg => GET /cdn/avatars/author_1.jpg
-// =======================
-app.use(
-  "/cdn",
-  express.static("public", {
-    fallthrough: true,
-    setHeaders: (res) => {
-      // Cache leve (dev). Ajustamos depois quando for S3/CDN real.
-      res.setHeader("Cache-Control", "public, max-age=60");
-
-      // Tentativa direta (e ainda temos o "hook" acima garantindo no writeHead)
-      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-    },
-  })
-);
-
-// força UTF-8 (API 100% JSON)
-// ⚠️ IMPORTANTE: NÃO aplicar em /cdn (imagens, assets, etc.)
+// força UTF-8 (API 100% JSON) — não aplicar em /cdn
 app.use((req, res, next) => {
   if (req.path.startsWith("/cdn")) return next();
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -117,8 +109,6 @@ app.use(express.json({ limit: "1mb" }));
 // =======================
 // ROUTES BASE (DX)
 // =======================
-
-// Root: evita "Cannot GET /" e dá um banner útil
 app.get("/", (_req, res) => {
   return res.json({
     ok: true,
@@ -136,7 +126,9 @@ app.get("/", (_req, res) => {
       "/timeline",
       "/profile (PUT) [legacy]",
       "/me/profile (GET,PUT) [PROFILE_v1]",
+      "/me/avatar (POST multipart) [PROFILE_v1]",
       "/authors/:id/profile (GET) [PROFILE_v1]",
+      "/cdn/avatars/:authorId/avatar (canônico, sem extensão)",
       "/cdn/* (static) [MVP CDN local]",
       "/health",
     ],
@@ -182,7 +174,6 @@ app.use("/authors", authorsRouter);
 // =======================
 // HELPERS (CORE)
 // =======================
-
 function safeDateMs(value) {
   if (!value) return null;
   const d1 = new Date(value);
@@ -210,7 +201,6 @@ function mkNav(kind, id, extra) {
 
   const k = String(kind || "").toLowerCase();
 
-  // ✅ Rotas do FRONTEND (React Router)
   if (k === "memory") return `/memories/${n}`;
   if (k === "chapter") return `/chapters/${n}`;
 
@@ -232,7 +222,7 @@ function clampInt(n, min, max, fallback) {
 }
 
 function normalizeNullableString(v, maxLen = 200) {
-  if (v === undefined) return undefined; // ausente => não mexe
+  if (v === undefined) return undefined;
   if (v === null) return null;
   const s = String(v).trim();
   if (!s) return null;
@@ -250,7 +240,6 @@ function makePreview(text, maxLen = 120) {
 // =======================
 // PROFILE_v1 (MVP) — Trilho Perfil (sem tocar core)
 // =======================
-
 function normalizeNullableStringStrict(v, maxLen, fieldName) {
   if (v === undefined) return { ok: true, value: undefined };
   if (v === null) return { ok: true, value: null };
@@ -270,6 +259,98 @@ function getAuthorIdFromToken(req) {
   if (!Number.isInteger(authorId) || authorId <= 0) return null;
   return authorId;
 }
+
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
+}
+
+function guessExtFromMime(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m === "image/jpeg" || m === "image/jpg") return "jpg";
+  if (m === "image/png") return "png";
+  if (m === "image/webp") return "webp";
+  return null;
+}
+
+function authorAvatarFolder(authorId) {
+  return path.join(AVATARS_DIR, `author_${authorId}`);
+}
+
+async function removeExistingAvatarFiles(authorId) {
+  try {
+    const dir = authorAvatarFolder(authorId);
+    await ensureDir(dir);
+    const files = await fsp.readdir(dir);
+
+    // remove canônico e legado
+    const toDelete = files.filter((f) => {
+      const s = String(f || "");
+      if (/^avatar\.(jpg|jpeg|png|webp)$/i.test(s)) return true;          // avatar.jpg
+      if (new RegExp(`^avatar_${authorId}\\.(jpg|jpeg|png|webp)$`, "i").test(s)) return true; // avatar_1.jpg
+      return false;
+    });
+
+    for (const f of toDelete) {
+      try {
+        await fsp.unlink(path.join(dir, f));
+      } catch {}
+    }
+  } catch {}
+}
+
+async function findExistingAvatarFile(authorId) {
+  try {
+    const dir = authorAvatarFolder(authorId);
+    const files = await fsp.readdir(dir);
+
+    // prefer canônico
+    const canon = files.find((x) => /^avatar\.(jpg|jpeg|png|webp)$/i.test(x));
+    if (canon) return path.join(dir, canon);
+
+    // fallback legado: avatar_<id>.ext
+    const legacy = files.find((x) =>
+      new RegExp(`^avatar_${authorId}\\.(jpg|jpeg|png|webp)$`, "i").test(x)
+    );
+    return legacy ? path.join(dir, legacy) : null;
+  } catch {
+    return null;
+  }
+}
+
+// =======================
+// CDN AVATAR CANÔNICO (SEM EXTENSÃO)
+// GET /cdn/avatars/:authorId/avatar
+// ⚠️ IMPORTANTE: ESTA ROTA PRECISA VIR ANTES DO express.static("/cdn", ...)
+// =======================
+app.get("/cdn/avatars/:authorId/avatar", async (req, res) => {
+  const authorId = Number(req.params.authorId);
+  if (!Number.isInteger(authorId) || authorId <= 0) {
+    return res.status(400).json({ error: "author_id inválido" });
+  }
+
+  const p = await findExistingAvatarFile(authorId);
+  if (!p) return res.status(404).end();
+
+  res.setHeader("Cache-Control", "public, max-age=60");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+  return res.sendFile(p);
+});
+
+// =======================
+// CDN LOCAL (MVP) — /cdn/*  (STATIC)
+// Serve arquivos estáticos em /public
+// =======================
+app.use(
+  "/cdn",
+  express.static(PUBLIC_DIR, {
+    fallthrough: true,
+    setHeaders: (res) => {
+      res.setHeader("Cache-Control", "public, max-age=60");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    },
+  })
+);
 
 /**
  * GET /authors/:id/profile (público)
@@ -382,49 +463,27 @@ app.get("/me/profile", authenticate, async (req, res, next) => {
 
 /**
  * PUT /me/profile (self)
+ * ✅ NÃO aceita avatar_url (avatar é gerenciado via upload/backend)
  */
 app.put("/me/profile", authenticate, async (req, res, next) => {
   try {
     const authorId = getAuthorIdFromToken(req);
     if (!authorId) return res.status(401).json({ error: "Não autenticado." });
 
-    const a = normalizeNullableStringStrict(
-      req.body?.name_public,
-      120,
-      "name_public"
-    );
-    const b = normalizeNullableStringStrict(
-      req.body?.bio_short,
-      280,
-      "bio_short"
-    );
+    const a = normalizeNullableStringStrict(req.body?.name_public, 120, "name_public");
+    const b = normalizeNullableStringStrict(req.body?.bio_short, 280, "bio_short");
     const l = normalizeNullableStringStrict(req.body?.location, 120, "location");
-    const u = normalizeNullableStringStrict(
-      req.body?.avatar_url,
-      400,
-      "avatar_url"
-    );
 
-    if (!a.ok)
-      return res.status(400).json({ error: "Payload inválido", detail: a.error });
-    if (!b.ok)
-      return res.status(400).json({ error: "Payload inválido", detail: b.error });
-    if (!l.ok)
-      return res.status(400).json({ error: "Payload inválido", detail: l.error });
-    if (!u.ok)
-      return res.status(400).json({ error: "Payload inválido", detail: u.error });
+    if (!a.ok) return res.status(400).json({ error: "Payload inválido", detail: a.error });
+    if (!b.ok) return res.status(400).json({ error: "Payload inválido", detail: b.error });
+    if (!l.ok) return res.status(400).json({ error: "Payload inválido", detail: l.error });
 
-    const nothing =
-      a.value === undefined &&
-      b.value === undefined &&
-      l.value === undefined &&
-      u.value === undefined;
+    const nothing = a.value === undefined && b.value === undefined && l.value === undefined;
 
     if (nothing) {
       return res.status(400).json({
         error: "Nenhum campo enviado.",
-        detail:
-          "Envie ao menos um: name_public, bio_short, location, avatar_url (podem ser null).",
+        detail: "Envie ao menos um: name_public, bio_short, location (podem ser null).",
       });
     }
 
@@ -434,36 +493,17 @@ app.put("/me/profile", authenticate, async (req, res, next) => {
       .request()
       .input("author_id", sql.Int, authorId)
       .input("has_name_public", sql.Bit, a.value !== undefined ? 1 : 0)
-      .input(
-        "name_public",
-        sql.NVarChar(120),
-        a.value === undefined ? null : a.value
-      )
+      .input("name_public", sql.NVarChar(120), a.value === undefined ? null : a.value)
       .input("has_bio_short", sql.Bit, b.value !== undefined ? 1 : 0)
-      .input(
-        "bio_short",
-        sql.NVarChar(280),
-        b.value === undefined ? null : b.value
-      )
+      .input("bio_short", sql.NVarChar(280), b.value === undefined ? null : b.value)
       .input("has_location", sql.Bit, l.value !== undefined ? 1 : 0)
-      .input(
-        "location",
-        sql.NVarChar(120),
-        l.value === undefined ? null : l.value
-      )
-      .input("has_avatar_url", sql.Bit, u.value !== undefined ? 1 : 0)
-      .input(
-        "avatar_url",
-        sql.NVarChar(400),
-        u.value === undefined ? null : u.value
-      )
+      .input("location", sql.NVarChar(120), l.value === undefined ? null : l.value)
       .query(`
         UPDATE a
         SET
           name_public = CASE WHEN @has_name_public = 1 THEN @name_public ELSE a.name_public END,
           bio_short   = CASE WHEN @has_bio_short   = 1 THEN @bio_short   ELSE a.bio_short   END,
           location    = CASE WHEN @has_location    = 1 THEN @location    ELSE a.location    END,
-          avatar_url  = CASE WHEN @has_avatar_url  = 1 THEN @avatar_url  ELSE a.avatar_url  END,
           updated_at  = SYSUTCDATETIME()
         FROM dbo.identity_author a
         WHERE a.author_id = @author_id;
@@ -512,12 +552,95 @@ app.put("/me/profile", authenticate, async (req, res, next) => {
 });
 
 // =======================
+// AVATAR UPLOAD (PROFILE_v1)
+// POST /me/avatar  (multipart/form-data, field: "file")
+// - salva em /public/avatars/author_<id>/avatar.<ext>
+// - atualiza dbo.identity_author.avatar_url = /cdn/avatars/<id>/avatar?v=<ts>
+// =======================
+if (multer) {
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+    fileFilter: (_req, file, cb) => {
+      const ext = guessExtFromMime(file?.mimetype);
+      if (!ext) return cb(new Error("Formato inválido. Use JPG, PNG ou WEBP."));
+      return cb(null, true);
+    },
+  });
+
+  app.post("/me/avatar", authenticate, upload.single("file"), async (req, res, next) => {
+    try {
+      const authorId = getAuthorIdFromToken(req);
+      if (!authorId) return res.status(401).json({ error: "Não autenticado." });
+
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({
+          error: "Arquivo ausente.",
+          detail: 'Envie multipart/form-data com campo "file".',
+        });
+      }
+
+      const ext = guessExtFromMime(req.file.mimetype);
+      if (!ext) {
+        return res.status(415).json({
+          error: "Formato inválido.",
+          detail: "Use JPG, PNG ou WEBP.",
+        });
+      }
+
+      const dir = authorAvatarFolder(authorId);
+      await ensureDir(dir);
+
+      await removeExistingAvatarFiles(authorId);
+
+      // ✅ canônico
+      const filename = `avatar.${ext}`;
+      const outPath = path.join(dir, filename);
+
+      await fsp.writeFile(outPath, req.file.buffer);
+
+      if (!fs.existsSync(outPath)) {
+        return res.status(500).json({ error: "Falha ao salvar avatar." });
+      }
+
+      const v = Date.now();
+      const avatarUrl = `/cdn/avatars/${authorId}/avatar?v=${v}`;
+
+      const pool = await getPool();
+      await pool
+        .request()
+        .input("author_id", sql.Int, authorId)
+        .input("avatar_url", sql.NVarChar(400), avatarUrl)
+        .query(`
+          UPDATE dbo.identity_author
+          SET avatar_url = @avatar_url,
+              updated_at = SYSUTCDATETIME()
+          WHERE author_id = @author_id;
+        `);
+
+      return res.json({
+        ok: true,
+        author_id: authorId,
+        avatar_url: avatarUrl,
+        meta: { saved_at: new Date().toISOString() },
+      });
+    } catch (err) {
+      return next(err);
+    }
+  });
+} else {
+  app.post("/me/avatar", authenticate, (_req, res) => {
+    return res.status(501).json({
+      error: "Upload não habilitado.",
+      detail:
+        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /me/avatar.",
+    });
+  });
+}
+
+// =======================
 // PROFILE (LEGACY CORE) — mantém como está
 // =======================
-/**
- * PUT /profile
- * body: { display_name?: string|null, preferred_language?: string|null }
- */
 app.put("/profile", authenticate, async (req, res, next) => {
   try {
     const authorId = Number(req.user?.author_id);
@@ -526,25 +649,19 @@ app.put("/profile", authenticate, async (req, res, next) => {
     }
 
     const displayName = normalizeNullableString(req.body?.display_name, 200);
-    const preferredLanguage = normalizeNullableString(
-      req.body?.preferred_language,
-      20
-    );
+    const preferredLanguage = normalizeNullableString(req.body?.preferred_language, 20);
 
     if (
       preferredLanguage !== undefined &&
       preferredLanguage !== null &&
       !/^[a-z]{2}(-[A-Z]{2})?$/.test(preferredLanguage)
     ) {
-      return res
-        .status(422)
-        .json({ error: "preferred_language inválido (ex.: pt-BR, en-US)." });
+      return res.status(422).json({ error: "preferred_language inválido (ex.: pt-BR, en-US)." });
     }
 
     if (displayName === undefined && preferredLanguage === undefined) {
       return res.status(400).json({
-        error:
-          "Nenhum campo enviado. Use display_name e/ou preferred_language (podem ser null).",
+        error: "Nenhum campo enviado. Use display_name e/ou preferred_language (podem ser null).",
       });
     }
 
@@ -590,9 +707,7 @@ app.put("/profile", authenticate, async (req, res, next) => {
         author_id: authorId,
         author_code: authorCode,
         display_name: displayNameOut || authorCode || null,
-        preferred_language: row?.preferred_language
-          ? String(row.preferred_language)
-          : null,
+        preferred_language: row?.preferred_language ? String(row.preferred_language) : null,
       },
       meta: { updated_at: new Date().toISOString() },
     });
@@ -604,7 +719,6 @@ app.put("/profile", authenticate, async (req, res, next) => {
 // =======================
 // FEED (CORE)
 // =======================
-
 function compareFeedDescDeterministic(a, b) {
   const da = safeDateMs(a?.date) ?? -Infinity;
   const db = safeDateMs(b?.date) ?? -Infinity;
@@ -660,9 +774,7 @@ app.get("/feed", authenticate, async (req, res, next) => {
       author_id: authorId,
       author_code: authorCode,
       display_name: displayNameRaw || authorCode || null,
-      preferred_language: pr?.preferred_language
-        ? String(pr.preferred_language)
-        : null,
+      preferred_language: pr?.preferred_language ? String(pr.preferred_language) : null,
     };
 
     const memR = await pool
@@ -750,9 +862,7 @@ app.get("/feed", authenticate, async (req, res, next) => {
       const chapterId = Number(c.chapter_id);
       const title = normalizeText(c.title, "(Capítulo sem título)");
 
-      const activityIso = normalizeIsoOrNow(
-        c.published_at ?? c.updated_at ?? c.created_at
-      );
+      const activityIso = normalizeIsoOrNow(c.published_at ?? c.updated_at ?? c.created_at);
 
       const description = normalizeText(c.description, "");
       const descriptionPreview = makePreview(description, 140);
@@ -781,12 +891,7 @@ app.get("/feed", authenticate, async (req, res, next) => {
       meta: {
         generated_at: new Date().toISOString(),
         limit,
-        summary: {
-          counts: {
-            memories: memories.length,
-            chapters: chapters.length,
-          },
-        },
+        summary: { counts: { memories: memories.length, chapters: chapters.length } },
       },
     });
   } catch (err) {
@@ -797,7 +902,6 @@ app.get("/feed", authenticate, async (req, res, next) => {
 // =======================
 // TIMELINE (CORE)
 // =======================
-
 function compareAscDeterministic(a, b) {
   const da = safeDateMs(a?.date) ?? -Infinity;
   const db = safeDateMs(b?.date) ?? -Infinity;
@@ -940,21 +1044,14 @@ app.get("/timeline", authenticate, async (req, res, next) => {
       };
     });
 
-    const events = [...memories, ...chapters, ...versions].sort(
-      compareAscDeterministic
-    );
+    const events = [...memories, ...chapters, ...versions].sort(compareAscDeterministic);
 
     return res.json({
       items: events,
       meta: {
         author_id: authorId,
         generated_at: new Date().toISOString(),
-        sources: {
-          memories: true,
-          chapters: true,
-          versions: true,
-          ledger: false,
-        },
+        sources: { memories: true, chapters: true, versions: true, ledger: false },
       },
     });
   } catch (err) {
@@ -975,7 +1072,9 @@ console.log("[ROUTE] OK /timeline");
 console.log("[ROUTE] OK /feed");
 console.log("[ROUTE] OK /profile (PUT) [legacy]");
 console.log("[ROUTE] OK /me/profile (GET,PUT) [PROFILE_v1]");
+console.log("[ROUTE] OK /me/avatar (POST multipart) [PROFILE_v1]");
 console.log("[ROUTE] OK /authors/:id/profile (GET) [PROFILE_v1]");
+console.log("[ROUTE] OK /cdn/avatars/:authorId/avatar (canônico, sem extensão)");
 console.log("[ROUTE] OK /cdn/* (static) [MVP CDN local]");
 console.log("[ROUTE] OK /health");
 console.log("[ROUTE] OK / (root)");
@@ -994,6 +1093,13 @@ app.use((err, _req, res, _next) => {
     detail: err?.message,
   });
 });
+
+console.log("[BOOT] server file:", __filename);
+console.log("[BOOT] PUBLIC_DIR:", PUBLIC_DIR);
+console.log("[BOOT] AVATARS_DIR:", AVATARS_DIR);
+console.log("[BOOT] has CDN avatar route:", typeof app._router?.stack?.find?.(r => r?.route?.path === "/cdn/avatars/:authorId/avatar") !== "undefined");
+
+
 
 // LISTEN (Docker-safe)
 app.listen(PORT, "0.0.0.0", () => {
