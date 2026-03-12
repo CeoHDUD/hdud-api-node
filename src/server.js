@@ -24,13 +24,13 @@ import memoryRouter from "./routes/memory.js";
 import memoriesRouter from "./routes/memories.js";
 import authorsRouter from "./routes/authors.js";
 import chaptersRouter from "./routes/chapters.js";
+import timelineRouter from "./routes/timeline.js";
 
 import { authenticate } from "./middleware/auth.js";
 import { getPool, sql } from "./db.js";
 
 const PORT = process.env.PORT || 4000;
 
-// versão do serviço (override via env se quiser)
 const SERVICE_VERSION =
   process.env.HDUD_API_VERSION ||
   process.env.npm_package_version ||
@@ -38,13 +38,6 @@ const SERVICE_VERSION =
 
 const app = express();
 
-/**
- * FIX DEFINITIVO (sem dependência externa):
- * - Helmet pode setar CORP= same-origin no fim
- * - express.static setHeaders pode NÃO vencer dependendo da ordem interna
- *
- * Então nós "hookamos" res.writeHead e garantimos o header final para /cdn.
- */
 function forceHeadersOnWriteHead(res, fn) {
   const origWriteHead = res.writeHead;
   res.writeHead = function (...args) {
@@ -55,25 +48,13 @@ function forceHeadersOnWriteHead(res, fn) {
   };
 }
 
-// =======================
-// PUBLIC DIR (FIX DEFINITIVO DO /cdn)
-// =======================
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// src/server.js -> ../public
 const PUBLIC_DIR = path.resolve(__dirname, "../public");
-
-// CDN local avatar dir (estrutura tipo S3 local)
 const AVATARS_DIR = path.join(PUBLIC_DIR, "avatars");
 
-// =======================
-// CORS (para chamadas fetch/XHR)
-// =======================
 app.use(cors({ origin: "*" }));
 
-// =======================
-// GARANTIA FINAL DE HEADERS PARA /cdn/*
-// =======================
 app.use((req, res, next) => {
   if (req.path.startsWith("/cdn")) {
     forceHeadersOnWriteHead(res, () => {
@@ -83,9 +64,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// =======================
-// Helmet (produção)
-// =======================
 if (helmet) {
   const helmetMw = helmet({
     contentSecurityPolicy: false,
@@ -97,7 +75,6 @@ if (helmet) {
   });
 }
 
-// força UTF-8 (API 100% JSON) — não aplicar em /cdn
 app.use((req, res, next) => {
   if (req.path.startsWith("/cdn")) return next();
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -106,9 +83,6 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "1mb" }));
 
-// =======================
-// ROUTES BASE (DX)
-// =======================
 app.get("/", (_req, res) => {
   return res.json({
     ok: true,
@@ -117,17 +91,23 @@ app.get("/", (_req, res) => {
     time: new Date().toISOString(),
     routes: [
       "/auth",
+      "/api/auth",
       "/memory",
       "/memories (via /)",
       "/authors",
       "/chapters",
       "/api/chapters",
       "/feed",
+      "/api/feed (alias)",
       "/timeline",
+      "/api/timeline (alias)",
       "/profile (PUT) [legacy]",
       "/me/profile (GET,PUT) [PROFILE_v1]",
+      "/api/me/profile (GET,PUT) [alias]",
       "/me/avatar (POST multipart) [PROFILE_v1]",
+      "/api/me/avatar (POST multipart) [alias]",
       "/authors/:id/profile (GET) [PROFILE_v1]",
+      "/api/authors/:id/profile (GET) [alias]",
       "/cdn/avatars/:authorId/avatar (canônico, sem extensão)",
       "/cdn/* (static) [MVP CDN local]",
       "/health",
@@ -135,7 +115,6 @@ app.get("/", (_req, res) => {
   });
 });
 
-// Health: check real do banco
 app.get("/health", async (_req, res) => {
   try {
     const pool = await getPool();
@@ -158,22 +137,20 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// =======================
-// ROTAS
-// =======================
 app.use("/auth", authRouter);
+app.use("/api/auth", authRouter);
+console.log("[ROUTE] OK /api/auth");
 
-// ✅ Capítulos — contrato oficial
 app.use("/chapters", chaptersRouter);
-app.use("/api/chapters", chaptersRouter); // alias para frontend
+app.use("/api/chapters", chaptersRouter);
 
 app.use("/memory", memoryRouter);
 app.use("/", memoriesRouter);
+app.use("/api", memoriesRouter);
 app.use("/authors", authorsRouter);
+app.use("/timeline", timelineRouter);
+app.use("/api/timeline", timelineRouter);
 
-// =======================
-// HELPERS (CORE)
-// =======================
 function safeDateMs(value) {
   if (!value) return null;
   const d1 = new Date(value);
@@ -237,9 +214,6 @@ function makePreview(text, maxLen = 120) {
   return oneLine.length > maxLen ? oneLine.slice(0, maxLen - 1) + "…" : oneLine;
 }
 
-// =======================
-// PROFILE_v1 (MVP) — Trilho Perfil (sem tocar core)
-// =======================
 function normalizeNullableStringStrict(v, maxLen, fieldName) {
   if (v === undefined) return { ok: true, value: undefined };
   if (v === null) return { ok: true, value: null };
@@ -282,11 +256,10 @@ async function removeExistingAvatarFiles(authorId) {
     await ensureDir(dir);
     const files = await fsp.readdir(dir);
 
-    // remove canônico e legado
     const toDelete = files.filter((f) => {
       const s = String(f || "");
-      if (/^avatar\.(jpg|jpeg|png|webp)$/i.test(s)) return true;          // avatar.jpg
-      if (new RegExp(`^avatar_${authorId}\\.(jpg|jpeg|png|webp)$`, "i").test(s)) return true; // avatar_1.jpg
+      if (/^avatar\.(jpg|jpeg|png|webp)$/i.test(s)) return true;
+      if (new RegExp(`^avatar_${authorId}\\.(jpg|jpeg|png|webp)$`, "i").test(s)) return true;
       return false;
     });
 
@@ -303,11 +276,9 @@ async function findExistingAvatarFile(authorId) {
     const dir = authorAvatarFolder(authorId);
     const files = await fsp.readdir(dir);
 
-    // prefer canônico
     const canon = files.find((x) => /^avatar\.(jpg|jpeg|png|webp)$/i.test(x));
     if (canon) return path.join(dir, canon);
 
-    // fallback legado: avatar_<id>.ext
     const legacy = files.find((x) =>
       new RegExp(`^avatar_${authorId}\\.(jpg|jpeg|png|webp)$`, "i").test(x)
     );
@@ -317,11 +288,6 @@ async function findExistingAvatarFile(authorId) {
   }
 }
 
-// =======================
-// CDN AVATAR CANÔNICO (SEM EXTENSÃO)
-// GET /cdn/avatars/:authorId/avatar
-// ⚠️ IMPORTANTE: ESTA ROTA PRECISA VIR ANTES DO express.static("/cdn", ...)
-// =======================
 app.get("/cdn/avatars/:authorId/avatar", async (req, res) => {
   const authorId = Number(req.params.authorId);
   if (!Number.isInteger(authorId) || authorId <= 0) {
@@ -337,10 +303,6 @@ app.get("/cdn/avatars/:authorId/avatar", async (req, res) => {
   return res.sendFile(p);
 });
 
-// =======================
-// CDN LOCAL (MVP) — /cdn/*  (STATIC)
-// Serve arquivos estáticos em /public
-// =======================
 app.use(
   "/cdn",
   express.static(PUBLIC_DIR, {
@@ -352,10 +314,7 @@ app.use(
   })
 );
 
-/**
- * GET /authors/:id/profile (público)
- */
-app.get("/authors/:id/profile", async (req, res, next) => {
+async function handleAuthorPublicProfile(req, res, next) {
   try {
     const authorId = Number(req.params.id);
     if (!Number.isInteger(authorId) || authorId <= 0) {
@@ -398,12 +357,12 @@ app.get("/authors/:id/profile", async (req, res, next) => {
   } catch (err) {
     return next(err);
   }
-});
+}
 
-/**
- * GET /me/profile (self)
- */
-app.get("/me/profile", authenticate, async (req, res, next) => {
+app.get("/authors/:id/profile", handleAuthorPublicProfile);
+app.get("/api/authors/:id/profile", handleAuthorPublicProfile);
+
+async function handleMeProfile(req, res, next) {
   try {
     const authorId = getAuthorIdFromToken(req);
     if (!authorId) return res.status(401).json({ error: "Não autenticado." });
@@ -459,13 +418,12 @@ app.get("/me/profile", authenticate, async (req, res, next) => {
   } catch (err) {
     return next(err);
   }
-});
+}
 
-/**
- * PUT /me/profile (self)
- * ✅ NÃO aceita avatar_url (avatar é gerenciado via upload/backend)
- */
-app.put("/me/profile", authenticate, async (req, res, next) => {
+app.get("/me/profile", authenticate, handleMeProfile);
+app.get("/api/me/profile", authenticate, handleMeProfile);
+
+async function handleMeProfilePut(req, res, next) {
   try {
     const authorId = getAuthorIdFromToken(req);
     if (!authorId) return res.status(401).json({ error: "Não autenticado." });
@@ -549,18 +507,15 @@ app.put("/me/profile", authenticate, async (req, res, next) => {
   } catch (err) {
     return next(err);
   }
-});
+}
 
-// =======================
-// AVATAR UPLOAD (PROFILE_v1)
-// POST /me/avatar  (multipart/form-data, field: "file")
-// - salva em /public/avatars/author_<id>/avatar.<ext>
-// - atualiza dbo.identity_author.avatar_url = /cdn/avatars/<id>/avatar?v=<ts>
-// =======================
+app.put("/me/profile", authenticate, handleMeProfilePut);
+app.put("/api/me/profile", authenticate, handleMeProfilePut);
+
 if (multer) {
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+    limits: { fileSize: 2 * 1024 * 1024 },
     fileFilter: (_req, file, cb) => {
       const ext = guessExtFromMime(file?.mimetype);
       if (!ext) return cb(new Error("Formato inválido. Use JPG, PNG ou WEBP."));
@@ -568,7 +523,7 @@ if (multer) {
     },
   });
 
-  app.post("/me/avatar", authenticate, upload.single("file"), async (req, res, next) => {
+  async function handleMeAvatarUpload(req, res, next) {
     try {
       const authorId = getAuthorIdFromToken(req);
       if (!authorId) return res.status(401).json({ error: "Não autenticado." });
@@ -593,7 +548,6 @@ if (multer) {
 
       await removeExistingAvatarFiles(authorId);
 
-      // ✅ canônico
       const filename = `avatar.${ext}`;
       const outPath = path.join(dir, filename);
 
@@ -627,7 +581,10 @@ if (multer) {
     } catch (err) {
       return next(err);
     }
-  });
+  }
+
+  app.post("/me/avatar", authenticate, upload.single("file"), handleMeAvatarUpload);
+  app.post("/api/me/avatar", authenticate, upload.single("file"), handleMeAvatarUpload);
 } else {
   app.post("/me/avatar", authenticate, (_req, res) => {
     return res.status(501).json({
@@ -636,11 +593,16 @@ if (multer) {
         "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /me/avatar.",
     });
   });
+
+  app.post("/api/me/avatar", authenticate, (_req, res) => {
+    return res.status(501).json({
+      error: "Upload não habilitado.",
+      detail:
+        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/me/avatar.",
+    });
+  });
 }
 
-// =======================
-// PROFILE (LEGACY CORE) — mantém como está
-// =======================
 app.put("/profile", authenticate, async (req, res, next) => {
   try {
     const authorId = Number(req.user?.author_id);
@@ -716,9 +678,6 @@ app.put("/profile", authenticate, async (req, res, next) => {
   }
 });
 
-// =======================
-// FEED (CORE)
-// =======================
 function compareFeedDescDeterministic(a, b) {
   const da = safeDateMs(a?.date) ?? -Infinity;
   const db = safeDateMs(b?.date) ?? -Infinity;
@@ -737,7 +696,158 @@ function compareFeedDescDeterministic(a, b) {
   return 0;
 }
 
-app.get("/feed", authenticate, async (req, res, next) => {
+function compareFeedV01(a, b) {
+  const sa = Number(a?.score ?? 0);
+  const sb = Number(b?.score ?? 0);
+  if (sa !== sb) return sb - sa;
+
+  const da = safeDateMs(a?.activity_at) ?? -Infinity;
+  const db = safeDateMs(b?.activity_at) ?? -Infinity;
+  if (da !== db) return db - da;
+
+  const ka = String(a?.kind ?? "");
+  const kb = String(b?.kind ?? "");
+  if (ka !== kb) return ka < kb ? -1 : 1;
+
+  const ida = String(a?.object?.id ?? "");
+  const idb = String(b?.object?.id ?? "");
+  if (ida < idb) return -1;
+  if (ida > idb) return 1;
+
+  const aa = String(a?.activity_at ?? "");
+  const ab = String(b?.activity_at ?? "");
+  if (aa < ab) return -1;
+  if (aa > ab) return 1;
+
+  return 0;
+}
+
+function hashStringToInt(input) {
+  const s = String(input ?? "");
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function prng01(seed) {
+  let x = (seed >>> 0) || 123456789;
+  x = (Math.imul(1664525, x) + 1013904223) >>> 0;
+  return x / 4294967296;
+}
+
+function actionWeight(action) {
+  const a = String(action || "").toLowerCase();
+  if (a === "published") return 40;
+  if (a === "created") return 20;
+  if (a === "updated") return 10;
+  return 0;
+}
+
+function kindBoost(kind) {
+  const k = String(kind || "").toLowerCase();
+  if (k === "chapter") return 15;
+  if (k === "memory") return 10;
+  if (k === "version") return 5;
+  return 0;
+}
+
+function computeRecencyScore(activityAtIso) {
+  const now = Date.now();
+  const ms = safeDateMs(activityAtIso);
+  const ageMin = typeof ms === "number" ? Math.max(0, (now - ms) / 60000) : 999999;
+
+  const x = ageMin;
+  const s = 900 / (1 + x / 240);
+  return Math.max(0, Math.floor(s));
+}
+
+function socialSignalScore(counts) {
+  const c = counts || {};
+  const likes = Number(c.likes || 0);
+  const comments = Number(c.comments || 0);
+  const reposts = Number(c.reposts || 0);
+  const saves = Number(c.saves || 0);
+  const raw = likes * 3 + comments * 12 + reposts * 16 + saves * 10;
+  return Math.max(0, Math.min(250, raw));
+}
+
+function computeScoreVNext({ kind, action, activity_at, social }) {
+  const rec = computeRecencyScore(activity_at);
+  const aw = actionWeight(action);
+  const kb = kindBoost(kind);
+  const ss = socialSignalScore(social?.counts);
+  return rec + aw + kb + ss;
+}
+
+function normalizeV01Action(kind, meta) {
+  const k = String(kind || "").toLowerCase();
+  if (k === "chapter") {
+    const st = String(meta?.status ?? "").toLowerCase();
+    if (st === "published") return "published";
+    if (meta?.published_at) return "published";
+    return "created";
+  }
+  if (k === "memory") {
+    const src = String(meta?.date_source ?? "").toLowerCase();
+    if (src === "activity_at") return "updated";
+    return "created";
+  }
+  if (k === "version") return "updated";
+  return "created";
+}
+
+function buildSocialBlockStubVNext({ seedKey, action, kind }) {
+  const verbMap = {
+    published: "publicou",
+    created: "criou",
+    updated: "atualizou",
+  };
+  const verb = verbMap[String(action || "").toLowerCase()] || "movimentou";
+
+  const seed = hashStringToInt(`${seedKey}|${action}|${kind}`);
+  const r1 = prng01(seed);
+  const r2 = prng01(seed ^ 0x9e3779b9);
+  const r3 = prng01(seed ^ 0x85ebca6b);
+
+  const likes = Math.floor(r1 * 18);
+  const comments = Math.floor(r2 * 6);
+  const reposts = Math.floor(r3 * 4);
+  const saves = Math.floor(prng01(seed ^ 0xc2b2ae35) * 8);
+
+  const poolNames = [
+    "Ana Silva",
+    "João Lima",
+    "Maria Souza",
+    "Pedro Santos",
+    "Bruno Almeida",
+    "Lucas Vieira",
+    "Carla Nunes",
+    "Rafael Costa",
+    "Juliana Rocha",
+    "Fernanda Dias",
+  ];
+
+  const pickCount = Math.max(0, Math.min(3, Math.floor(prng01(seed ^ 0x27d4eb2d) * 4)));
+  const people = [];
+  for (let i = 0; i < pickCount; i++) {
+    const idx = Math.floor(prng01(seed ^ (i * 1315423911)) * poolNames.length);
+    people.push({ name: poolNames[idx] });
+  }
+
+  const friendOf = prng01(seed ^ 0x165667b1) > 0.72 ? { label: "conhecido de você" } : null;
+
+  return {
+    friendOf,
+    people,
+    verb,
+    counts: { likes, comments, reposts, saves },
+  };
+}
+
+async function handleFeed(req, res, next) {
   try {
     const authorIdRaw = req.user?.author_id;
     const authorId = Number(authorIdRaw);
@@ -747,6 +857,7 @@ app.get("/feed", authenticate, async (req, res, next) => {
     }
 
     const limit = clampInt(req.query?.limit, 1, 50, 20);
+    const v = String(req.query?.v ?? "").trim().toLowerCase();
 
     const pool = await getPool();
 
@@ -757,6 +868,11 @@ app.get("/feed", authenticate, async (req, res, next) => {
         SELECT TOP 1
           a.author_id,
           a.author_code,
+          a.full_name,
+          a.name_public,
+          a.bio_short,
+          a.location,
+          a.avatar_url,
           p.display_name,
           p.preferred_language
         FROM dbo.identity_author a
@@ -770,11 +886,24 @@ app.get("/feed", authenticate, async (req, res, next) => {
     const authorCode = pr?.author_code ? String(pr.author_code) : null;
     const displayNameRaw = pr?.display_name ? String(pr.display_name) : null;
 
-    const profile = {
+    const namePublic =
+      (pr?.name_public && String(pr.name_public).trim()) ||
+      (pr?.full_name && String(pr.full_name).trim()) ||
+      displayNameRaw ||
+      authorCode ||
+      null;
+
+    const profileLegacy = {
       author_id: authorId,
       author_code: authorCode,
       display_name: displayNameRaw || authorCode || null,
       preferred_language: pr?.preferred_language ? String(pr.preferred_language) : null,
+    };
+
+    const actorV01 = {
+      author_id: authorId,
+      name_public: namePublic,
+      avatar_url: pr?.avatar_url != null ? String(pr.avatar_url) : null,
     };
 
     const memR = await pool
@@ -804,7 +933,7 @@ app.get("/feed", authenticate, async (req, res, next) => {
           AND ISNULL(m.is_deleted, 0) = 0;
       `);
 
-    const memories = (memR.recordset || []).map((m) => {
+    const memoriesLegacy = (memR.recordset || []).map((m) => {
       const memoryId = Number(m.memory_id);
       const title = normalizeText(m.title, "(Memória sem título)");
 
@@ -858,7 +987,7 @@ app.get("/feed", authenticate, async (req, res, next) => {
           AND ISNULL(c.is_deleted, 0) = 0;
       `);
 
-    const chapters = (chapR.recordset || []).map((c) => {
+    const chaptersLegacy = (chapR.recordset || []).map((c) => {
       const chapterId = Number(c.chapter_id);
       const title = normalizeText(c.title, "(Capítulo sem título)");
 
@@ -877,209 +1006,128 @@ app.get("/feed", authenticate, async (req, res, next) => {
           date_source: "activity_at",
           activity_at: activityIso,
           status: c.status ?? null,
+          published_at: c.published_at ?? null,
           description: descriptionPreview || undefined,
         },
       };
     });
 
-    const allItems = [...chapters, ...memories].sort(compareFeedDescDeterministic);
-    const items = allItems.slice(0, limit);
+    const allLegacy = [...chaptersLegacy, ...memoriesLegacy].sort(compareFeedDescDeterministic);
+    const legacyItems = allLegacy.slice(0, limit);
+
+    const wantsV01 = v === "0.1" || v === "v0.1" || v === "1";
+
+    if (wantsV01) {
+      const v01Candidates = (allLegacy || []).map((it) => {
+        const kind = String(it.type || "").toLowerCase();
+        const activityAt = it?.meta?.activity_at || it?.date || new Date().toISOString();
+        const action = normalizeV01Action(kind, it?.meta);
+
+        const idNum = Number(it?.source_id);
+        const id = Number.isFinite(idNum) && idNum > 0 ? idNum : String(it?.source_id ?? "");
+
+        const obj = {
+          kind,
+          id,
+          title: normalizeText(it?.title, "(sem título)"),
+          nav: it?.meta?.nav || "/",
+          preview: it?.meta?.preview || it?.meta?.description || null,
+          meta: {
+            phase_code: it?.meta?.phase_code ?? null,
+            chapter_id: it?.meta?.chapter_id ?? null,
+            status: it?.meta?.status ?? null,
+            published_at: it?.meta?.published_at ?? null,
+          },
+        };
+
+        const activityIso = new Date(safeDateMs(activityAt) ?? Date.now()).toISOString();
+
+        const seedKey = `${kind}:${String(obj.id)}`;
+        const social = buildSocialBlockStubVNext({ seedKey, action, kind });
+
+        const score = computeScoreVNext({
+          kind,
+          action,
+          activity_at: activityIso,
+          social,
+        });
+
+        return {
+          actor: actorV01,
+          kind,
+          action,
+          activity_at: activityIso,
+          object: obj,
+          social,
+          score,
+        };
+      });
+
+      const v01Items = v01Candidates.sort(compareFeedV01).slice(0, limit);
+
+      return res.json({
+        version: "FEED_v0.1",
+        actor: actorV01,
+        items: v01Items,
+        meta: {
+          generated_at: new Date().toISOString(),
+          limit,
+          ranking: "MOVE_D(recency + action_weight + social_signal)",
+          weights: {
+            action: { published: 40, created: 20, updated: 10 },
+            social: { like: 3, comment: 12, repost: 16, save: 10 },
+          },
+          summary: {
+            counts: { memories: memoriesLegacy.length, chapters: chaptersLegacy.length },
+          },
+        },
+        legacy: {
+          profile: profileLegacy,
+          items: legacyItems,
+        },
+      });
+    }
 
     return res.json({
-      profile,
-      items,
+      profile: profileLegacy,
+      items: legacyItems,
       meta: {
         generated_at: new Date().toISOString(),
         limit,
-        summary: { counts: { memories: memories.length, chapters: chapters.length } },
+        summary: { counts: { memories: memoriesLegacy.length, chapters: chaptersLegacy.length } },
       },
     });
   } catch (err) {
     return next(err);
   }
-});
-
-// =======================
-// TIMELINE (CORE)
-// =======================
-function compareAscDeterministic(a, b) {
-  const da = safeDateMs(a?.date) ?? -Infinity;
-  const db = safeDateMs(b?.date) ?? -Infinity;
-
-  if (da !== db) return da - db;
-
-  const sa = String(a?.source_id ?? "");
-  const sb = String(b?.source_id ?? "");
-  if (sa < sb) return -1;
-  if (sa > sb) return 1;
-  return 0;
 }
 
-app.get("/timeline", authenticate, async (req, res, next) => {
-  try {
-    const authorIdRaw = req.user?.author_id;
-    const authorId = Number(authorIdRaw);
+app.get("/feed", authenticate, handleFeed);
+app.get("/api/feed", authenticate, handleFeed);
 
-    if (!Number.isInteger(authorId) || authorId <= 0) {
-      return res.status(401).json({ error: "Não autenticado." });
-    }
-
-    const pool = await getPool();
-
-    const memResult = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .query(`
-        SELECT
-          m.memory_id,
-          m.author_id,
-          m.title,
-          m.created_at,
-          m.version_number,
-          m.is_deleted
-        FROM dbo.identity_memory m
-        WHERE m.author_id = @author_id
-          AND ISNULL(m.is_deleted, 0) = 0;
-      `);
-
-    const memories = (memResult.recordset || []).map((m) => {
-      const memoryId = Number(m.memory_id);
-      const title = normalizeText(m.title, "(Memória sem título)");
-      const date = normalizeIsoOrNow(m.created_at);
-
-      return {
-        type: "memory",
-        title,
-        date,
-        source_id: String(memoryId),
-        meta: {
-          nav: mkNav("memory", memoryId),
-          date_source: "created_at",
-          memory_id: memoryId,
-          current_version: m.version_number ?? null,
-        },
-      };
-    });
-
-    const chapResult = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .query(`
-        SELECT
-          c.chapter_id,
-          c.author_id,
-          c.title,
-          c.created_at,
-          c.updated_at,
-          c.published_at,
-          c.status,
-          ISNULL(c.is_deleted, 0) AS is_deleted
-        FROM dbo.identity_chapter c
-        WHERE c.author_id = @author_id
-          AND ISNULL(c.is_deleted, 0) = 0;
-      `);
-
-    const chapters = (chapResult.recordset || []).map((c) => {
-      const chapterId = Number(c.chapter_id);
-      const title = normalizeText(c.title, "(Capítulo sem título)");
-      const date = normalizeIsoOrNow(c.created_at);
-
-      return {
-        type: "chapter",
-        title,
-        date,
-        source_id: String(chapterId),
-        meta: {
-          nav: mkNav("chapter", chapterId),
-          date_source: "created_at",
-          chapter_id: chapterId,
-          status: c.status ?? null,
-          published_at: c.published_at ?? null,
-        },
-      };
-    });
-
-    const verResult = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .query(`
-        SELECT
-          v.memory_id,
-          v.version_number,
-          v.title,
-          v.created_at,
-          m.title AS memory_title
-        FROM dbo.identity_memory_versions v
-        INNER JOIN dbo.identity_memory m
-          ON m.memory_id = v.memory_id
-        WHERE m.author_id = @author_id
-          AND ISNULL(m.is_deleted, 0) = 0;
-      `);
-
-    const versions = (verResult.recordset || []).map((v) => {
-      const memoryId = Number(v.memory_id);
-      const versionNumber = Number(v.version_number);
-
-      const baseTitle = normalizeText(v.memory_title, "(Memória sem título)");
-      const titleSnap = normalizeText(v.title, "");
-      const title =
-        titleSnap && titleSnap !== baseTitle
-          ? `Versão ${versionNumber} — ${titleSnap}`
-          : `Versão ${versionNumber} — ${baseTitle}`;
-
-      const date = normalizeIsoOrNow(v.created_at);
-      const sourceId = `${memoryId}:${versionNumber}`;
-
-      return {
-        type: "version",
-        title,
-        date,
-        source_id: sourceId,
-        meta: {
-          nav: mkNav("version", memoryId, { version_number: versionNumber }),
-          date_source: "version.created_at",
-          memory_id: memoryId,
-          version_number: versionNumber,
-        },
-      };
-    });
-
-    const events = [...memories, ...chapters, ...versions].sort(compareAscDeterministic);
-
-    return res.json({
-      items: events,
-      meta: {
-        author_id: authorId,
-        generated_at: new Date().toISOString(),
-        sources: { memories: true, chapters: true, versions: true, ledger: false },
-      },
-    });
-  } catch (err) {
-    return next(err);
-  }
-});
-
-// =======================
-// LOG
-// =======================
 console.log("[ROUTE] OK /auth");
+console.log("[ROUTE] OK /api/auth");
 console.log("[ROUTE] OK /chapters");
 console.log("[ROUTE] OK /api/chapters");
 console.log("[ROUTE] OK /memory");
 console.log("[ROUTE] OK /");
 console.log("[ROUTE] OK /authors");
 console.log("[ROUTE] OK /timeline");
+console.log("[ROUTE] OK /api/timeline (alias)");
 console.log("[ROUTE] OK /feed");
+console.log("[ROUTE] OK /api/feed (alias)");
 console.log("[ROUTE] OK /profile (PUT) [legacy]");
 console.log("[ROUTE] OK /me/profile (GET,PUT) [PROFILE_v1]");
+console.log("[ROUTE] OK /api/me/profile (GET,PUT) [alias]");
 console.log("[ROUTE] OK /me/avatar (POST multipart) [PROFILE_v1]");
+console.log("[ROUTE] OK /api/me/avatar (POST multipart) [alias]");
 console.log("[ROUTE] OK /authors/:id/profile (GET) [PROFILE_v1]");
+console.log("[ROUTE] OK /api/authors/:id/profile (GET) [alias]");
 console.log("[ROUTE] OK /cdn/avatars/:authorId/avatar (canônico, sem extensão)");
 console.log("[ROUTE] OK /cdn/* (static) [MVP CDN local]");
 console.log("[ROUTE] OK /health");
 console.log("[ROUTE] OK / (root)");
 
-// Error handler
 app.use((err, _req, res, _next) => {
   const status =
     err?.statusCode ||
@@ -1097,11 +1145,12 @@ app.use((err, _req, res, _next) => {
 console.log("[BOOT] server file:", __filename);
 console.log("[BOOT] PUBLIC_DIR:", PUBLIC_DIR);
 console.log("[BOOT] AVATARS_DIR:", AVATARS_DIR);
-console.log("[BOOT] has CDN avatar route:", typeof app._router?.stack?.find?.(r => r?.route?.path === "/cdn/avatars/:authorId/avatar") !== "undefined");
+console.log(
+  "[BOOT] has CDN avatar route:",
+  typeof app._router?.stack?.find?.((r) => r?.route?.path === "/cdn/avatars/:authorId/avatar") !==
+    "undefined"
+);
 
-
-
-// LISTEN (Docker-safe)
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HDUD API listening on :${PORT}`);
 });

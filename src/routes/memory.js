@@ -11,6 +11,11 @@ import { requireMemoryOwnership } from "../middleware/ownership.js";
 import { getPool, sql } from "../db.js";
 import { ROLES, userHasRole } from "../middleware/roles.js";
 
+import {
+  createNarrativeEvent,
+  buildEventKey,
+} from "../services/narrative-events.js";
+
 const router = express.Router();
 
 function canEditFromReq(req, authorId) {
@@ -297,6 +302,25 @@ router.post("/", authenticate, async (req, res) => {
     if (!row) return res.status(500).json({ error: "Falha ao criar memória." });
 
     const fresh = await selectMemoryById(pool, Number(row.memory_id));
+	// 🔵 Evento narrativo: memória criada
+	try {
+	  await createNarrativeEvent({
+		authorId,
+		eventType: "memory_created",
+		memoryId: Number(row.memory_id),
+		eventKey: buildEventKey("memory_created", [
+		  "author",
+		  authorId,
+		  "memory",
+		  row.memory_id,
+		]),
+		metadata: {
+		  title: row.title ?? null,
+		},
+	  });
+	} catch (err) {
+	  console.warn("NarrativeEvent memory_created failed:", err?.message);
+	}	
     return res.status(201).json(attachMeta(fresh || row, req, authorId));
   } catch (err) {
     console.error("[POST /memory] erro:", err);

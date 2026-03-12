@@ -1,7 +1,7 @@
 ﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js
 // Rotas deste arquivo:
 // - POST /memories                      -> (contrato) payload { content: string }
-// - GET  /memories                      -> (alias) lista memórias do author do token (para /api/memories)
+// - GET  /memories                      -> inventário simples (items) + payload legado (memories)
 // - GET  /authors/:authorId/memories
 // - POST /authors/:authorId/memories     -> dbo.p_CreateMemory_WithVersion
 // - GET  /memories/:id
@@ -188,6 +188,20 @@ async function updateMemoryPhase(pool, memoryId, authorId, phaseIdOrNull) {
   `);
 }
 
+function normalizeText(v, fallback = "") {
+  if (v == null) return fallback;
+  const s = String(v).trim();
+  return s.length ? s : fallback;
+}
+
+function makePreview(text, maxLen = 120) {
+  const s = normalizeText(text, "");
+  if (!s) return null;
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  if (!oneLine) return null;
+  return oneLine.length > maxLen ? oneLine.slice(0, maxLen - 1) + "…" : oneLine;
+}
+
 // ✅ select com phase meta
 // ⚠️ IMPORTANTE: não usar LEFT JOIN direto em identity_memory_chapter,
 // porque múltiplas linhas por memory_id multiplicam o resultado (duplicidade).
@@ -320,8 +334,8 @@ router.post("/memories", authenticate, async (req, res) => {
   }
 });
 
-// ✅ GET /memories (alias para inventário e listas simples)
-// - quando montado em /api, vira /api/memories e elimina o 404 do frontend
+// ✅ GET /memories — inventário para modal + mantém legado
+// - resolve o 404 do frontend quando este chama /memories ou /api/memories
 router.get("/memories", authenticate, async (req, res) => {
   try {
     const authorId = Number(req.user?.author_id);
@@ -334,7 +348,32 @@ router.get("/memories", authenticate, async (req, res) => {
 
     const pool = await getPool();
     const rows = await listMemoriesByAuthor(pool, authorId, req);
-    return res.json({ author_id: authorId, memories: rows });
+
+    // ✅ Inventário simples (o que o modal precisa)
+    const items = (rows || []).map((m) => {
+      const id = Number(m?.memory_id);
+      const title = normalizeText(m?.title, "(Memória sem título)");
+      const excerpt = makePreview(m?.content, 140);
+      return {
+        id,
+        title,
+        excerpt: excerpt || null,
+      };
+    });
+
+    // ✅ Resposta híbrida:
+    // - items: contrato leve para modal
+    // - memories: payload legado (para compat / debug / telas existentes)
+    return res.json({
+      author_id: authorId,
+      items,
+      memories: rows,
+      meta: {
+        count: items.length,
+        generated_at: new Date().toISOString(),
+        contract: "MEMORIES_INVENTORY_v0.1 (items) + legacy(memories)",
+      },
+    });
   } catch (err) {
     console.error("[GET /memories] erro:", err);
     return res.status(500).json({ error: "Erro ao listar memórias." });
