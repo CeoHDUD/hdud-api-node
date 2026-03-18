@@ -17,6 +17,9 @@ import chaptersRouter from "./routes/chapters.js";
 
 import { authenticate } from "./middleware/auth.js";
 import { getPool, sql } from "./db.js";
+import narrativeRoutes from "./routes/narrative.js";
+
+app.use("/api/narrative", narrativeRoutes);
 
 const PORT = process.env.PORT || 4000;
 

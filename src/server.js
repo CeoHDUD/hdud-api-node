@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import fsp from "fs/promises";
 
+
 let helmet = null;
 try {
   const mod = await import("helmet");
@@ -25,6 +26,7 @@ import memoriesRouter from "./routes/memories.js";
 import authorsRouter from "./routes/authors.js";
 import chaptersRouter from "./routes/chapters.js";
 import timelineRouter from "./routes/timeline.js";
+import networkRouter from "./routes/network.js";
 
 import { authenticate } from "./middleware/auth.js";
 import { getPool, sql } from "./db.js";
@@ -150,6 +152,11 @@ app.use("/api", memoriesRouter);
 app.use("/authors", authorsRouter);
 app.use("/timeline", timelineRouter);
 app.use("/api/timeline", timelineRouter);
+app.use("/network", networkRouter);
+app.use("/api/network", networkRouter);
+
+console.log("[ROUTE] OK /network");
+console.log("[ROUTE] OK /api/network");
 
 function safeDateMs(value) {
   if (!value) return null;

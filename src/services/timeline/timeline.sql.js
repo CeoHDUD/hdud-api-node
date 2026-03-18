@@ -64,6 +64,21 @@ export async function fetchNarrativeEventRows(pool, { authorId, q, limit }) {
 
   const cols = await getTableColumns(pool, "dbo", "identity_narrative_event");
 
+  const mapExists = await tableExists(pool, "dbo", "identity_memory_chapter");
+  const mapCols = mapExists
+    ? await getTableColumns(pool, "dbo", "identity_memory_chapter")
+    : new Set();
+
+  const chapterExists = await tableExists(pool, "dbo", "identity_chapter");
+  const chapterCols = chapterExists
+    ? await getTableColumns(pool, "dbo", "identity_chapter")
+    : new Set();
+
+  const memoryExists = await tableExists(pool, "dbo", "identity_memory");
+  const memoryCols = memoryExists
+    ? await getTableColumns(pool, "dbo", "identity_memory")
+    : new Set();
+
   const authorCol = firstExisting(cols, ["author_id"]);
   const eventIdCol = firstExisting(cols, ["narrative_event_id", "event_id", "id"]);
   const typeCol = firstExisting(cols, ["event_type", "type", "kind", "entity_type", "target_type"]);
@@ -76,6 +91,20 @@ export async function fetchNarrativeEventRows(pool, { authorId, q, limit }) {
   const createdAtCol = firstExisting(cols, ["created_at"]);
   const updatedAtCol = firstExisting(cols, ["updated_at"]);
 
+  const chapterDeletedCol = firstExisting(chapterCols, ["is_deleted"]);
+  const chapterTitleCol = firstExisting(chapterCols, ["title"]);
+  const chapterDescCol = firstExisting(chapterCols, ["description", "summary", "content"]);
+  const chapterAuthorCol = hasColumn(chapterCols, "author_id");
+
+  const memDeletedCol = firstExisting(memoryCols, ["is_deleted"]);
+  const memTitleCol = firstExisting(memoryCols, ["title"]);
+  const memContentCol = firstExisting(memoryCols, ["content"]);
+  const memAuthorCol = hasColumn(memoryCols, "author_id");
+
+  const mapAuthorCol = hasColumn(mapCols, "author_id");
+  const mapIsPrimaryCol = firstExisting(mapCols, ["is_primary"]);
+  const mapSortOrderCol = firstExisting(mapCols, ["sort_order"]);
+
   if (!authorCol) {
     return { exists: true, rows: [] };
   }
@@ -86,6 +115,10 @@ export async function fetchNarrativeEventRows(pool, { authorId, q, limit }) {
       titleCol ? `CAST(ne.[${titleCol}] AS NVARCHAR(MAX))` : null,
       noteCol ? `CAST(ne.[${noteCol}] AS NVARCHAR(MAX))` : null,
       metadataCol ? `CAST(ne.[${metadataCol}] AS NVARCHAR(MAX))` : null,
+      memTitleCol && memoryIdCol ? `CAST(mem.[${memTitleCol}] AS NVARCHAR(MAX))` : null,
+      memContentCol && memoryIdCol ? `CAST(mem.[${memContentCol}] AS NVARCHAR(MAX))` : null,
+      chapterTitleCol && memoryIdCol ? `CAST(linked.chapter_title AS NVARCHAR(MAX))` : null,
+      chapterDescCol && memoryIdCol ? `CAST(linked.chapter_description AS NVARCHAR(MAX))` : null,
     ],
   });
 
@@ -100,19 +133,78 @@ export async function fetchNarrativeEventRows(pool, { authorId, q, limit }) {
       ? `ne.[${eventIdCol}]`
       : "GETUTCDATE()";
 
+  const linkedChapterApply =
+    memoryIdCol && mapExists && chapterExists
+      ? `
+        OUTER APPLY (
+          SELECT TOP 1
+            mc.chapter_id,
+            ${chapterTitleCol ? `c.[${chapterTitleCol}]` : "NULL"} AS chapter_title,
+            ${chapterDescCol ? `c.[${chapterDescCol}]` : "NULL"} AS chapter_description,
+            ${
+              mapIsPrimaryCol
+                ? `CASE WHEN ISNULL(mc.[${mapIsPrimaryCol}], 0) = 1 THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END`
+                : `CAST(0 AS BIT)`
+            } AS chapter_is_primary
+          FROM dbo.identity_memory_chapter mc
+          LEFT JOIN dbo.identity_chapter c
+            ON c.chapter_id = mc.chapter_id
+            ${chapterAuthorCol ? `AND c.author_id = ne.[${authorCol}]` : ""}
+          WHERE mc.memory_id = ne.[${memoryIdCol}]
+            ${mapAuthorCol ? `AND mc.author_id = ne.[${authorCol}]` : ""}
+            ${chapterDeletedCol ? `AND ISNULL(c.[${chapterDeletedCol}], 0) = 0` : ""}
+          ORDER BY
+            ${mapIsPrimaryCol ? `ISNULL(mc.[${mapIsPrimaryCol}], 0) DESC,` : ""}
+            ${mapSortOrderCol ? `ISNULL(mc.[${mapSortOrderCol}], 2147483647),` : ""}
+            mc.chapter_id
+        ) linked
+      `
+      : `
+        OUTER APPLY (
+          SELECT
+            CAST(NULL AS INT) AS chapter_id,
+            CAST(NULL AS NVARCHAR(MAX)) AS chapter_title,
+            CAST(NULL AS NVARCHAR(MAX)) AS chapter_description,
+            CAST(0 AS BIT) AS chapter_is_primary
+        ) linked
+      `;
+
+  const memoryJoin =
+    memoryExists && memoryIdCol
+      ? `
+        LEFT JOIN dbo.identity_memory mem
+          ON mem.memory_id = ne.[${memoryIdCol}]
+          ${memAuthorCol ? `AND mem.author_id = ne.[${authorCol}]` : ""}
+          ${memDeletedCol ? `AND ISNULL(mem.[${memDeletedCol}], 0) = 0` : ""}
+      `
+      : "";
+
   const query = `
     SELECT TOP (@limit)
       ${eventIdCol ? `ne.[${eventIdCol}]` : "NULL"} AS narrative_event_id,
       ${typeCol ? `ne.[${typeCol}]` : "NULL"} AS event_type,
       ${memoryIdCol ? `ne.[${memoryIdCol}]` : "NULL"} AS memory_id,
-      ${chapterIdCol ? `ne.[${chapterIdCol}]` : "NULL"} AS chapter_id,
+      ${
+        chapterIdCol
+          ? `COALESCE(ne.[${chapterIdCol}], linked.chapter_id)`
+          : `linked.chapter_id`
+      } AS chapter_id,
+      ${chapterIdCol ? `ne.[${chapterIdCol}]` : "NULL"} AS narrative_chapter_id,
+      linked.chapter_id AS resolved_chapter_id,
+      linked.chapter_title,
+      linked.chapter_description,
+      linked.chapter_is_primary,
       ${titleCol ? `ne.[${titleCol}]` : "NULL"} AS title,
       ${noteCol ? `ne.[${noteCol}]` : "NULL"} AS note,
       ${metadataCol ? `ne.[${metadataCol}]` : "NULL"} AS metadata_json,
       ${eventAtCol ? `ne.[${eventAtCol}]` : "NULL"} AS event_at,
       ${createdAtCol ? `ne.[${createdAtCol}]` : "NULL"} AS created_at,
-      ${updatedAtCol ? `ne.[${updatedAtCol}]` : "NULL"} AS updated_at
+      ${updatedAtCol ? `ne.[${updatedAtCol}]` : "NULL"} AS updated_at,
+      ${memTitleCol ? `mem.[${memTitleCol}]` : "NULL"} AS memory_title,
+      ${memContentCol ? `mem.[${memContentCol}]` : "NULL"} AS memory_content
     FROM dbo.identity_narrative_event ne
+    ${linkedChapterApply}
+    ${memoryJoin}
     WHERE ne.[${authorCol}] = @author_id
       ${whereSearch}
     ORDER BY ${orderExpr} DESC, ${eventIdCol ? `ne.[${eventIdCol}] DESC` : orderExpr};
@@ -158,6 +250,8 @@ export async function fetchMemoryFallbackRows(pool, { authorId, q, limit }) {
   const versionNumberCol = firstExisting(verCols, ["version_number"]);
   const mapAuthorCol = hasColumn(mapCols, "author_id");
   const chapterAuthorCol = hasColumn(chapterCols, "author_id");
+  const mapIsPrimaryCol = firstExisting(mapCols, ["is_primary"]);
+  const mapSortOrderCol = firstExisting(mapCols, ["sort_order"]);
 
   const linkedChapterApply =
     mapExists && chapterExists
@@ -166,7 +260,12 @@ export async function fetchMemoryFallbackRows(pool, { authorId, q, limit }) {
           SELECT TOP 1
             mc.chapter_id,
             ${chapterTitleCol ? `c.[${chapterTitleCol}]` : "NULL"} AS chapter_title,
-            ${chapterDescCol ? `c.[${chapterDescCol}]` : "NULL"} AS chapter_description
+            ${chapterDescCol ? `c.[${chapterDescCol}]` : "NULL"} AS chapter_description,
+            ${
+              mapIsPrimaryCol
+                ? `CASE WHEN ISNULL(mc.[${mapIsPrimaryCol}], 0) = 1 THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END`
+                : `CAST(0 AS BIT)`
+            } AS chapter_is_primary
           FROM dbo.identity_memory_chapter mc
           LEFT JOIN dbo.identity_chapter c
             ON c.chapter_id = mc.chapter_id
@@ -175,8 +274,8 @@ export async function fetchMemoryFallbackRows(pool, { authorId, q, limit }) {
             ${mapAuthorCol ? "AND mc.author_id = m.author_id" : ""}
             ${chapterDeletedCol ? `AND ISNULL(c.[${chapterDeletedCol}], 0) = 0` : ""}
           ORDER BY
-            ${mapCols.has("is_primary") ? "ISNULL(mc.is_primary, 0) DESC," : ""}
-            ${mapCols.has("sort_order") ? "ISNULL(mc.sort_order, 2147483647)," : ""}
+            ${mapIsPrimaryCol ? `ISNULL(mc.[${mapIsPrimaryCol}], 0) DESC,` : ""}
+            ${mapSortOrderCol ? `ISNULL(mc.[${mapSortOrderCol}], 2147483647),` : ""}
             mc.chapter_id
         ) linked
       `
@@ -185,7 +284,8 @@ export async function fetchMemoryFallbackRows(pool, { authorId, q, limit }) {
           SELECT
             CAST(NULL AS INT) AS chapter_id,
             CAST(NULL AS NVARCHAR(MAX)) AS chapter_title,
-            CAST(NULL AS NVARCHAR(MAX)) AS chapter_description
+            CAST(NULL AS NVARCHAR(MAX)) AS chapter_description,
+            CAST(0 AS BIT) AS chapter_is_primary
         ) linked
       `;
 
@@ -275,6 +375,7 @@ export async function fetchMemoryFallbackRows(pool, { authorId, q, limit }) {
       linked.chapter_id,
       linked.chapter_title,
       linked.chapter_description,
+      linked.chapter_is_primary,
       ${directMatchScoreExpr} AS direct_match_score,
       ${chapterContextScoreExpr} AS chapter_context_score,
       ${matchReasonExpr} AS match_reason,
