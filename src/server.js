@@ -6,7 +6,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import fsp from "fs/promises";
-
+import meRouter from "./routes/me.js";
+import plansRouter from "./routes/plans.js";
+import feedRouter from "./routes/feed.js";
 
 let helmet = null;
 try {
@@ -18,6 +20,12 @@ let multer = null;
 try {
   const mod = await import("multer");
   multer = mod?.default || null;
+} catch {}
+
+let sharp = null;
+try {
+  const mod = await import("sharp");
+  sharp = mod?.default || mod || null;
 } catch {}
 
 import authRouter from "./routes/auth.js";
@@ -54,6 +62,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PUBLIC_DIR = path.resolve(__dirname, "../public");
 const AVATARS_DIR = path.join(PUBLIC_DIR, "avatars");
+const MEMORIES_DIR = path.join(PUBLIC_DIR, "memories");
+const MEMORY_MEDIA_DIR = path.join(PUBLIC_DIR, "memory-media");
 
 app.use(cors({ origin: "*" }));
 
@@ -83,7 +93,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 app.get("/", (_req, res) => {
   return res.json({
@@ -95,6 +105,12 @@ app.get("/", (_req, res) => {
       "/auth",
       "/api/auth",
       "/memory",
+      "/memory/:id/audio (GET, POST multipart) [MEMORY_AUDIO_v1]",
+      "/memory/:id/audio/:mediaId (GET) [MEMORY_AUDIO_v1]",
+      "/memory/:id/audio/:mediaId/transcribe (POST) [MEMORY_AUDIO_v1]",
+      "/memory/:id/audio/:mediaId/validate (PUT) [MEMORY_AUDIO_v1]",
+      "/memory/:id/audio/:mediaId/refine (POST) [MEMORY_AUDIO_v1]",
+      "/memory/:id/audio/:mediaId/apply (POST) [MEMORY_AUDIO_v1]",
       "/memories (via /)",
       "/authors",
       "/chapters",
@@ -103,14 +119,20 @@ app.get("/", (_req, res) => {
       "/api/feed (alias)",
       "/timeline",
       "/api/timeline (alias)",
+      "/network",
+      "/api/network",
       "/profile (PUT) [legacy]",
       "/me/profile (GET,PUT) [PROFILE_v1]",
       "/api/me/profile (GET,PUT) [alias]",
       "/me/avatar (POST multipart) [PROFILE_v1]",
       "/api/me/avatar (POST multipart) [alias]",
+      "/memory/:id/photo (POST multipart) [MEMORY_v1]",
+      "/api/memory/:id/photo (POST multipart) [alias]",
       "/authors/:id/profile (GET) [PROFILE_v1]",
       "/api/authors/:id/profile (GET) [alias]",
       "/cdn/avatars/:authorId/avatar (canônico, sem extensão)",
+      "/cdn/memories/:authorId/:memoryId (canônico, sem extensão)",
+      "/cdn/memory-media/:authorId/:memoryId/:mediaId/:variant (canônico imagem/áudio)",
       "/cdn/* (static) [MVP CDN local]",
       "/health",
     ],
@@ -145,7 +167,6 @@ console.log("[ROUTE] OK /api/auth");
 
 app.use("/chapters", chaptersRouter);
 app.use("/api/chapters", chaptersRouter);
-
 app.use("/memory", memoryRouter);
 app.use("/", memoriesRouter);
 app.use("/api", memoriesRouter);
@@ -154,7 +175,15 @@ app.use("/timeline", timelineRouter);
 app.use("/api/timeline", timelineRouter);
 app.use("/network", networkRouter);
 app.use("/api/network", networkRouter);
+app.use("/me", meRouter);
+app.use("/api/me", meRouter);
+app.use("/plans", plansRouter);
+app.use("/api/plans", plansRouter);
+app.use("/feed", feedRouter);
+app.use("/api/feed", feedRouter);
 
+console.log("[ROUTE] OK /feed");
+console.log("[ROUTE] OK /api/feed");
 console.log("[ROUTE] OK /network");
 console.log("[ROUTE] OK /api/network");
 
@@ -253,6 +282,16 @@ function guessExtFromMime(mime) {
   return null;
 }
 
+function guessAudioExtFromMime(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m === "audio/mpeg" || m === "audio/mp3") return "mp3";
+  if (m === "audio/mp4" || m === "audio/x-m4a" || m === "audio/aac") return "m4a";
+  if (m === "audio/wav" || m === "audio/wave" || m === "audio/x-wav") return "wav";
+  if (m === "audio/ogg" || m === "audio/opus") return "ogg";
+  if (m === "audio/webm") return "webm";
+  return null;
+}
+
 function authorAvatarFolder(authorId) {
   return path.join(AVATARS_DIR, `author_${authorId}`);
 }
@@ -295,6 +334,313 @@ async function findExistingAvatarFile(authorId) {
   }
 }
 
+function authorMemoryFolder(authorId) {
+  return path.join(MEMORIES_DIR, `author_${authorId}`);
+}
+
+function buildMemoryVariantBaseName(memoryId) {
+  return `memory_${memoryId}`;
+}
+
+function buildLegacyMemoryFileRegex(memoryId) {
+  return new RegExp(`^memory_${memoryId}\\.(jpg|jpeg|png|webp)$`, "i");
+}
+
+function buildDerivedMemoryFileRegex(memoryId) {
+  return new RegExp(
+    `^memory_${memoryId}_(original|feed|thumb)\\.(jpg|jpeg|png|webp)$`,
+    "i"
+  );
+}
+
+function normalizeImageVariant(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "original") return "original";
+  if (v === "thumb") return "thumb";
+  return "feed";
+}
+
+function classifyImageOrientation(width, height) {
+  const w = Number(width || 0);
+  const h = Number(height || 0);
+  if (!(w > 0) || !(h > 0)) return "unknown";
+
+  const ratio = w / h;
+  if (ratio > 2) return "panoramic";
+  if (ratio > 1.15) return "landscape";
+  if (ratio < 0.85) return "portrait";
+  return "square";
+}
+
+async function removeExistingMemoryPhotoFiles(authorId, memoryId) {
+  try {
+    const dir = authorMemoryFolder(authorId);
+    await ensureDir(dir);
+    const files = await fsp.readdir(dir);
+
+    const toDelete = files.filter((f) => {
+      const name = String(f || "");
+      return (
+        buildLegacyMemoryFileRegex(memoryId).test(name) ||
+        buildDerivedMemoryFileRegex(memoryId).test(name)
+      );
+    });
+
+    for (const f of toDelete) {
+      try {
+        await fsp.unlink(path.join(dir, f));
+      } catch {}
+    }
+  } catch {}
+}
+
+function memoryMediaFolder(authorId, memoryId, mediaId) {
+  return path.join(
+    PUBLIC_DIR,
+    "memory-media",
+    String(authorId),
+    `memory_${memoryId}`,
+    `media_${mediaId}`
+  );
+}
+
+async function findExistingMemoryImageFile(authorId, memoryId, mediaId, variant = "feed") {
+  try {
+    const dir = memoryMediaFolder(authorId, memoryId, mediaId);
+    const files = await fsp.readdir(dir);
+    const normalizedVariant = normalizeImageVariant(variant);
+
+    const preferredOrder =
+      normalizedVariant === "original"
+        ? ["original", "feed", "thumb"]
+        : normalizedVariant === "thumb"
+          ? ["thumb", "feed", "original"]
+          : ["feed", "original", "thumb"];
+
+    for (const item of preferredOrder) {
+      const found = files.find((x) =>
+        new RegExp(`^${item}\\.(jpg|jpeg|png|webp)$`, "i").test(String(x || ""))
+      );
+      if (found) return path.join(dir, found);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function findPrimaryMemoryImageMediaId(authorId, memoryId) {
+  try {
+    const pool = await getPool();
+    const result = await pool
+      .request()
+      .input("author_id", sql.Int, Number(authorId))
+      .input("memory_id", sql.Int, Number(memoryId))
+      .query(`
+        SELECT TOP 1 media_id
+        FROM dbo.identity_memory_media
+        WHERE author_id = @author_id
+          AND memory_id = @memory_id
+          AND media_type = 'image'
+          AND ISNULL(is_deleted, 0) = 0
+        ORDER BY is_primary_for_memory DESC, created_at DESC, media_id DESC;
+      `);
+
+    const mediaId = result.recordset?.[0]?.media_id;
+    return Number.isInteger(Number(mediaId)) && Number(mediaId) > 0
+      ? Number(mediaId)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function findExistingMemoryPhotoFile(authorId, memoryId, variant = "feed") {
+  try {
+    const primaryMediaId = await findPrimaryMemoryImageMediaId(authorId, memoryId);
+    if (primaryMediaId) {
+      const primaryPath = await findExistingMemoryImageFile(
+        authorId,
+        memoryId,
+        primaryMediaId,
+        variant
+      );
+      if (primaryPath) return primaryPath;
+    }
+
+    const dir = authorMemoryFolder(authorId);
+    const files = await fsp.readdir(dir);
+    const normalizedVariant = normalizeImageVariant(variant);
+
+    const preferredOrder =
+      normalizedVariant === "original"
+        ? ["original", "feed", "thumb"]
+        : normalizedVariant === "thumb"
+          ? ["thumb", "feed", "original"]
+          : ["feed", "original", "thumb"];
+
+    for (const item of preferredOrder) {
+      const found = files.find((x) =>
+        new RegExp(`^memory_${memoryId}_${item}\\.(jpg|jpeg|png|webp)$`, "i").test(
+          String(x || "")
+        )
+      );
+      if (found) return path.join(dir, found);
+    }
+
+    const legacy = files.find((x) =>
+      buildLegacyMemoryFileRegex(memoryId).test(String(x || ""))
+    );
+    return legacy ? path.join(dir, legacy) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function persistMemoryImageMeta(pool, memoryId, meta) {
+  if (!meta || !Number.isInteger(Number(memoryId)) || Number(memoryId) <= 0) return;
+
+  const width = Number(meta.width || 0);
+  const height = Number(meta.height || 0);
+  const aspectRatio =
+    Number.isFinite(Number(meta.aspect_ratio)) && Number(meta.aspect_ratio) > 0
+      ? Number(meta.aspect_ratio)
+      : null;
+  const orientation = normalizeNullableString(meta.orientation, 20);
+
+  await pool
+    .request()
+    .input("memory_id", sql.Int, Number(memoryId))
+    .input("image_width", sql.Int, Number.isInteger(width) && width > 0 ? width : null)
+    .input("image_height", sql.Int, Number.isInteger(height) && height > 0 ? height : null)
+    .input("image_aspect_ratio", sql.Decimal(10, 4), aspectRatio)
+    .input("image_orientation", sql.VarChar(20), orientation)
+    .query(`
+      IF COL_LENGTH('dbo.identity_memory', 'image_width') IS NOT NULL
+      BEGIN
+        UPDATE dbo.identity_memory
+        SET image_width = @image_width
+        WHERE memory_id = @memory_id;
+      END
+
+      IF COL_LENGTH('dbo.identity_memory', 'image_height') IS NOT NULL
+      BEGIN
+        UPDATE dbo.identity_memory
+        SET image_height = @image_height
+        WHERE memory_id = @memory_id;
+      END
+
+      IF COL_LENGTH('dbo.identity_memory', 'image_aspect_ratio') IS NOT NULL
+      BEGIN
+        UPDATE dbo.identity_memory
+        SET image_aspect_ratio = @image_aspect_ratio
+        WHERE memory_id = @memory_id;
+      END
+
+      IF COL_LENGTH('dbo.identity_memory', 'image_orientation') IS NOT NULL
+      BEGIN
+        UPDATE dbo.identity_memory
+        SET image_orientation = @image_orientation
+        WHERE memory_id = @memory_id;
+      END
+    `);
+}
+
+async function processMemoryPhotoVariants({ fileBuffer, outputDir, memoryId }) {
+  if (!sharp) {
+    const err = new Error(
+      "Dependência 'sharp' não encontrada. Instale 'sharp' no hdud-api-node para habilitar tratamento de imagem."
+    );
+    err.status = 501;
+    throw err;
+  }
+
+  await ensureDir(outputDir);
+
+  const baseName = buildMemoryVariantBaseName(memoryId);
+  const originalPath = path.join(outputDir, `${baseName}_original.jpg`);
+  const feedPath = path.join(outputDir, `${baseName}_feed.jpg`);
+  const thumbPath = path.join(outputDir, `${baseName}_thumb.jpg`);
+
+  const source = sharp(fileBuffer, { failOn: "none" }).rotate();
+  const metadata = await source.metadata();
+
+  const width = Number(metadata?.width || 0);
+  const height = Number(metadata?.height || 0);
+  const aspectRatio =
+    width > 0 && height > 0 ? Number((width / height).toFixed(4)) : null;
+  const orientation = classifyImageOrientation(width, height);
+
+  await source.clone().jpeg({ quality: 92, mozjpeg: true }).toFile(originalPath);
+
+  await source
+    .clone()
+    .resize(1200, 900, {
+      fit: "cover",
+      position: "centre",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 86, mozjpeg: true })
+    .toFile(feedPath);
+
+  await source
+    .clone()
+    .resize(400, 400, {
+      fit: "cover",
+      position: "centre",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 82, mozjpeg: true })
+    .toFile(thumbPath);
+
+  return {
+    paths: {
+      original: originalPath,
+      feed: feedPath,
+      thumb: thumbPath,
+    },
+    meta: {
+      width: width || null,
+      height: height || null,
+      aspect_ratio: aspectRatio,
+      orientation,
+    },
+  };
+}
+
+async function findExistingMemoryAudioFile(authorId, memoryId, mediaId) {
+  try {
+    const dir = memoryMediaFolder(authorId, memoryId, mediaId);
+    const files = await fsp.readdir(dir);
+
+    const canon = files.find((x) =>
+      /^original\.(mp3|m4a|wav|ogg|webm)$/i.test(String(x || ""))
+    );
+    return canon ? path.join(dir, canon) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function removeExistingMemoryAudioFiles(authorId, memoryId, mediaId) {
+  try {
+    const dir = memoryMediaFolder(authorId, memoryId, mediaId);
+    await ensureDir(dir);
+    const files = await fsp.readdir(dir);
+
+    const toDelete = files.filter((f) =>
+      /^original\.(mp3|m4a|wav|ogg|webm)$/i.test(String(f || ""))
+    );
+
+    for (const f of toDelete) {
+      try {
+        await fsp.unlink(path.join(dir, f));
+      } catch {}
+    }
+  } catch {}
+}
+
 app.get("/cdn/avatars/:authorId/avatar", async (req, res) => {
   const authorId = Number(req.params.authorId);
   if (!Number.isInteger(authorId) || authorId <= 0) {
@@ -302,12 +648,85 @@ app.get("/cdn/avatars/:authorId/avatar", async (req, res) => {
   }
 
   const p = await findExistingAvatarFile(authorId);
-  if (!p) return res.status(404).end();
+  if (!p) {
+    return res.status(204).end();
+  }
 
   res.setHeader("Cache-Control", "public, max-age=60");
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 
   return res.sendFile(p);
+});
+
+app.get("/cdn/memories/:authorId/:memoryId", async (req, res) => {
+  const authorId = Number(req.params.authorId);
+  const memoryId = Number(req.params.memoryId);
+  const variant = normalizeImageVariant(req.query?.variant);
+
+  if (!Number.isInteger(authorId) || authorId <= 0) {
+    return res.status(400).json({ error: "author_id inválido" });
+  }
+
+  if (!Number.isInteger(memoryId) || memoryId <= 0) {
+    return res.status(400).json({ error: "memory_id inválido" });
+  }
+
+  const p = await findExistingMemoryPhotoFile(authorId, memoryId, variant);
+  if (!p) {
+    return res.status(204).end();
+  }
+
+  res.setHeader("Cache-Control", "public, max-age=60");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+  return res.sendFile(p);
+});
+
+app.get("/cdn/memory-media/:authorId/:memoryId/:mediaId/:variant", async (req, res) => {
+  const authorId = Number(req.params.authorId);
+  const memoryId = Number(req.params.memoryId);
+  const mediaId = Number(req.params.mediaId);
+  const variant = String(req.params.variant || "").trim().toLowerCase();
+
+  if (!Number.isInteger(authorId) || authorId <= 0) {
+    return res.status(400).json({ error: "author_id inválido" });
+  }
+
+  if (!Number.isInteger(memoryId) || memoryId <= 0) {
+    return res.status(400).json({ error: "memory_id inválido" });
+  }
+
+  if (!Number.isInteger(mediaId) || mediaId <= 0) {
+    return res.status(400).json({ error: "media_id inválido" });
+  }
+
+  if (variant === "original" || variant === "feed" || variant === "thumb") {
+    const imagePath = await findExistingMemoryImageFile(
+      authorId,
+      memoryId,
+      mediaId,
+      variant
+    );
+
+    if (imagePath) {
+      res.setHeader("Cache-Control", "public, max-age=60");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      return res.sendFile(imagePath);
+    }
+
+    if (variant === "original") {
+      const audioPath = await findExistingMemoryAudioFile(authorId, memoryId, mediaId);
+      if (audioPath) {
+        res.setHeader("Cache-Control", "public, max-age=60");
+        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+        return res.sendFile(audioPath);
+      }
+    }
+
+    return res.status(204).end();
+  }
+
+  return res.status(400).json({ error: "variant inválida" });
 });
 
 app.use(
@@ -520,12 +939,24 @@ app.put("/me/profile", authenticate, handleMeProfilePut);
 app.put("/api/me/profile", authenticate, handleMeProfilePut);
 
 if (multer) {
-  const upload = multer({
+  const uploadImage = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 2 * 1024 * 1024 },
+    limits: { fileSize: 4 * 1024 * 1024 },
     fileFilter: (_req, file, cb) => {
       const ext = guessExtFromMime(file?.mimetype);
       if (!ext) return cb(new Error("Formato inválido. Use JPG, PNG ou WEBP."));
+      return cb(null, true);
+    },
+  });
+
+  const uploadAudio = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const ext = guessAudioExtFromMime(file?.mimetype);
+      if (!ext) {
+        return cb(new Error("Formato inválido. Use MP3, M4A, WAV, OGG ou WEBM."));
+      }
       return cb(null, true);
     },
   });
@@ -564,8 +995,7 @@ if (multer) {
         return res.status(500).json({ error: "Falha ao salvar avatar." });
       }
 
-      const v = Date.now();
-      const avatarUrl = `/cdn/avatars/${authorId}/avatar?v=${v}`;
+      const avatarUrl = `/cdn/avatars/${authorId}/avatar`;
 
       const pool = await getPool();
       await pool
@@ -590,8 +1020,303 @@ if (multer) {
     }
   }
 
-  app.post("/me/avatar", authenticate, upload.single("file"), handleMeAvatarUpload);
-  app.post("/api/me/avatar", authenticate, upload.single("file"), handleMeAvatarUpload);
+  async function handleMemoryPhotoUpload(req, res, next) {
+    try {
+      const tokenAuthorId = getAuthorIdFromToken(req);
+      if (!tokenAuthorId) return res.status(401).json({ error: "Não autenticado." });
+
+      const memoryId = Number(req.params.id);
+      if (!Number.isInteger(memoryId) || memoryId <= 0) {
+        return res.status(400).json({ error: "memory_id inválido." });
+      }
+
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({
+          error: "Arquivo ausente.",
+          detail: 'Envie multipart/form-data com campo "file".',
+        });
+      }
+
+      const ext = guessExtFromMime(req.file.mimetype);
+      if (!ext) {
+        return res.status(415).json({
+          error: "Formato inválido.",
+          detail: "Use JPG, PNG ou WEBP.",
+        });
+      }
+
+      const pool = await getPool();
+      const mem = await pool
+        .request()
+        .input("memory_id", sql.Int, memoryId)
+        .query(`
+          SELECT TOP 1 memory_id, author_id, is_deleted
+          FROM dbo.identity_memory
+          WHERE memory_id = @memory_id;
+        `);
+
+      const row = mem.recordset?.[0] || null;
+      if (!row || row.is_deleted) {
+        return res.status(404).json({ error: "Memória não encontrada." });
+      }
+
+      const ownerAuthorId = Number(row.author_id);
+      if (ownerAuthorId !== tokenAuthorId) {
+        return res.status(403).json({ error: "Permissão negada." });
+      }
+
+      const dir = authorMemoryFolder(ownerAuthorId);
+      await ensureDir(dir);
+      await removeExistingMemoryPhotoFiles(ownerAuthorId, memoryId);
+
+      const processed = await processMemoryPhotoVariants({
+        fileBuffer: req.file.buffer,
+        outputDir: dir,
+        memoryId,
+      });
+
+      if (!fs.existsSync(processed.paths.feed)) {
+        return res.status(500).json({ error: "Falha ao salvar foto da memória." });
+      }
+
+      const photoUrl = `/cdn/memories/${ownerAuthorId}/${memoryId}`;
+
+      await pool
+        .request()
+        .input("memory_id", sql.Int, memoryId)
+        .input("photo_url", sql.NVarChar(1000), photoUrl)
+        .query(`
+          UPDATE dbo.identity_memory
+          SET photo_url = @photo_url
+          WHERE memory_id = @memory_id;
+        `);
+
+      await persistMemoryImageMeta(pool, memoryId, processed.meta);
+
+      return res.json({
+        ok: true,
+        author_id: ownerAuthorId,
+        memory_id: memoryId,
+        photo_url: photoUrl,
+        photo_variants: {
+          original: `${photoUrl}?variant=original`,
+          feed: `${photoUrl}?variant=feed`,
+          thumb: `${photoUrl}?variant=thumb`,
+        },
+        image_meta: processed.meta,
+        meta: { saved_at: new Date().toISOString() },
+      });
+    } catch (err) {
+      return next(err);
+    }
+  }
+
+  async function handleMemoryAudioUpload(req, res, next) {
+    try {
+      const tokenAuthorId = getAuthorIdFromToken(req);
+      if (!tokenAuthorId) return res.status(401).json({ error: "Não autenticado." });
+
+      const memoryId = Number(req.params.id);
+      if (!Number.isInteger(memoryId) || memoryId <= 0) {
+        return res.status(400).json({ error: "memory_id inválido." });
+      }
+
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({
+          error: "Arquivo ausente.",
+          detail: 'Envie multipart/form-data com campo "file".',
+        });
+      }
+
+      const ext = guessAudioExtFromMime(req.file.mimetype);
+      if (!ext) {
+        return res.status(415).json({
+          error: "Formato inválido.",
+          detail: "Use MP3, M4A, WAV, OGG ou WEBM.",
+        });
+      }
+
+      const durationSecondsRaw = req.body?.duration_seconds;
+      const durationSeconds =
+        durationSecondsRaw != null && String(durationSecondsRaw).trim() !== ""
+          ? Number(durationSecondsRaw)
+          : null;
+
+      const isPrimaryRaw = String(req.body?.is_primary ?? "true").trim().toLowerCase();
+      const isPrimary = isPrimaryRaw === "true" || isPrimaryRaw === "1";
+
+      const pool = await getPool();
+      const mem = await pool
+        .request()
+        .input("memory_id", sql.Int, memoryId)
+        .query(`
+          SELECT TOP 1 memory_id, author_id, is_deleted
+          FROM dbo.identity_memory
+          WHERE memory_id = @memory_id;
+        `);
+
+      const row = mem.recordset?.[0] || null;
+      if (!row || row.is_deleted) {
+        return res.status(404).json({ error: "Memória não encontrada." });
+      }
+
+      const ownerAuthorId = Number(row.author_id);
+      if (ownerAuthorId !== tokenAuthorId) {
+        return res.status(403).json({ error: "Permissão negada." });
+      }
+
+      if (isPrimary) {
+        await pool
+          .request()
+          .input("memory_id", sql.Int, memoryId)
+          .query(`
+            UPDATE dbo.identity_memory_media
+            SET is_primary_for_memory = 0,
+                updated_at = SYSUTCDATETIME()
+            WHERE memory_id = @memory_id
+              AND media_type = 'audio'
+              AND ISNULL(is_deleted, 0) = 0;
+          `);
+      }
+
+      const insertR = await pool
+        .request()
+        .input("memory_id", sql.Int, memoryId)
+        .input("author_id", sql.Int, ownerAuthorId)
+        .input("media_type", sql.VarChar(20), "audio")
+        .input("storage_provider", sql.VarChar(30), "local")
+        .input("storage_path", sql.NVarChar(500), "")
+        .input("original_file_name", sql.NVarChar(260), req.file.originalname || null)
+        .input("mime_type", sql.VarChar(100), req.file.mimetype || null)
+        .input("file_size_bytes", sql.BigInt, Number(req.file.size || req.file.buffer.length || 0))
+        .input(
+          "duration_seconds",
+          sql.Int,
+          Number.isFinite(durationSeconds) && durationSeconds > 0
+            ? Math.trunc(durationSeconds)
+            : null
+        )
+        .input("transcription_status", sql.VarChar(30), "pending")
+        .input("language_code", sql.VarChar(20), "pt-BR")
+        .input("is_primary_for_memory", sql.Bit, isPrimary ? 1 : 0)
+        .query(`
+          INSERT INTO dbo.identity_memory_media
+          (
+            memory_id,
+            author_id,
+            media_type,
+            storage_provider,
+            storage_path,
+            original_file_name,
+            mime_type,
+            file_size_bytes,
+            duration_seconds,
+            transcription_status,
+            language_code,
+            is_primary_for_memory
+          )
+          OUTPUT INSERTED.media_id
+          VALUES
+          (
+            @memory_id,
+            @author_id,
+            @media_type,
+            @storage_provider,
+            @storage_path,
+            @original_file_name,
+            @mime_type,
+            @file_size_bytes,
+            @duration_seconds,
+            @transcription_status,
+            @language_code,
+            @is_primary_for_memory
+          );
+        `);
+
+      const mediaId = Number(insertR.recordset?.[0]?.media_id);
+      if (!Number.isInteger(mediaId) || mediaId <= 0) {
+        return res.status(500).json({ error: "Falha ao registrar áudio da memória." });
+      }
+
+      const dir = memoryMediaFolder(ownerAuthorId, memoryId, mediaId);
+      await ensureDir(dir);
+      await removeExistingMemoryAudioFiles(ownerAuthorId, memoryId, mediaId);
+
+      const filename = `original.${ext}`;
+      const outPath = path.join(dir, filename);
+
+      await fsp.writeFile(outPath, req.file.buffer);
+
+      if (!fs.existsSync(outPath)) {
+        return res.status(500).json({ error: "Falha ao salvar áudio da memória." });
+      }
+
+      const storagePath = `/cdn/memory-media/${ownerAuthorId}/${memoryId}/${mediaId}/original`;
+
+      await pool
+        .request()
+        .input("media_id", sql.BigInt, mediaId)
+        .input("storage_path", sql.NVarChar(500), storagePath)
+        .query(`
+          UPDATE dbo.identity_memory_media
+          SET storage_path = @storage_path,
+              updated_at = SYSUTCDATETIME()
+          WHERE media_id = @media_id;
+        `);
+
+      if (
+        typeof row.memory_id === "number" ||
+        Number.isInteger(Number(row.memory_id))
+      ) {
+        try {
+          await pool
+            .request()
+            .input("memory_id", sql.Int, memoryId)
+            .input("origin_type", sql.VarChar(30), "narrated_audio")
+            .query(`
+              IF COL_LENGTH('dbo.identity_memory', 'origin_type') IS NOT NULL
+              BEGIN
+                UPDATE dbo.identity_memory
+                SET origin_type = CASE
+                    WHEN origin_type IS NULL OR LTRIM(RTRIM(origin_type)) = '' THEN @origin_type
+                    ELSE origin_type
+                END
+                WHERE memory_id = @memory_id;
+              END
+            `);
+        } catch {}
+      }
+
+      return res.status(201).json({
+        ok: true,
+        memory_id: memoryId,
+        media: {
+          media_id: mediaId,
+          media_type: "audio",
+          audio_url: storagePath,
+          mime_type: req.file.mimetype || null,
+          file_size_bytes: Number(req.file.size || req.file.buffer.length || 0),
+          duration_seconds:
+            Number.isFinite(durationSeconds) && durationSeconds > 0
+              ? Math.trunc(durationSeconds)
+              : null,
+          transcription_status: "pending",
+          is_primary_for_memory: isPrimary,
+        },
+      });
+    } catch (err) {
+      return next(err);
+    }
+  }
+
+  app.post("/me/avatar", authenticate, uploadImage.single("file"), handleMeAvatarUpload);
+  app.post("/api/me/avatar", authenticate, uploadImage.single("file"), handleMeAvatarUpload);
+
+  app.post("/memory/:id/photo", authenticate, uploadImage.single("file"), handleMemoryPhotoUpload);
+  app.post("/api/memory/:id/photo", authenticate, uploadImage.single("file"), handleMemoryPhotoUpload);
+
+  app.post("/memory/:id/audio", authenticate, uploadAudio.single("file"), handleMemoryAudioUpload);
+  app.post("/api/memory/:id/audio", authenticate, uploadAudio.single("file"), handleMemoryAudioUpload);
 } else {
   app.post("/me/avatar", authenticate, (_req, res) => {
     return res.status(501).json({
@@ -608,269 +1333,55 @@ if (multer) {
         "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/me/avatar.",
     });
   });
-}
 
-app.put("/profile", authenticate, async (req, res, next) => {
-  try {
-    const authorId = Number(req.user?.author_id);
-    if (!Number.isInteger(authorId) || authorId <= 0) {
-      return res.status(401).json({ error: "Não autenticado." });
-    }
-
-    const displayName = normalizeNullableString(req.body?.display_name, 200);
-    const preferredLanguage = normalizeNullableString(req.body?.preferred_language, 20);
-
-    if (
-      preferredLanguage !== undefined &&
-      preferredLanguage !== null &&
-      !/^[a-z]{2}(-[A-Z]{2})?$/.test(preferredLanguage)
-    ) {
-      return res.status(422).json({ error: "preferred_language inválido (ex.: pt-BR, en-US)." });
-    }
-
-    if (displayName === undefined && preferredLanguage === undefined) {
-      return res.status(400).json({
-        error: "Nenhum campo enviado. Use display_name e/ou preferred_language (podem ser null).",
-      });
-    }
-
-    const pool = await getPool();
-
-    const r = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .input("display_name", sql.NVarChar(200), displayName ?? null)
-      .input("preferred_language", sql.NVarChar(20), preferredLanguage ?? null)
-      .query(`
-        UPDATE p
-        SET
-          display_name = COALESCE(@display_name, p.display_name),
-          preferred_language = COALESCE(@preferred_language, p.preferred_language)
-        FROM dbo.identity_profile p
-        WHERE p.author_id = @author_id;
-
-        IF (@@ROWCOUNT = 0)
-        BEGIN
-          INSERT INTO dbo.identity_profile (author_id, display_name, preferred_language)
-          VALUES (@author_id, @display_name, @preferred_language);
-        END
-
-        SELECT TOP 1
-          a.author_id,
-          a.author_code,
-          p.display_name,
-          p.preferred_language
-        FROM dbo.identity_author a
-        LEFT JOIN dbo.identity_profile p
-          ON p.author_id = a.author_id
-        WHERE a.author_id = @author_id;
-      `);
-
-    const row = r.recordset?.[0] || null;
-
-    const authorCode = row?.author_code ? String(row.author_code) : null;
-    const displayNameOut = row?.display_name ? String(row.display_name) : null;
-
-    return res.json({
-      profile: {
-        author_id: authorId,
-        author_code: authorCode,
-        display_name: displayNameOut || authorCode || null,
-        preferred_language: row?.preferred_language ? String(row.preferred_language) : null,
-      },
-      meta: { updated_at: new Date().toISOString() },
+  app.post("/memory/:id/photo", authenticate, (_req, res) => {
+    return res.status(501).json({
+      error: "Upload não habilitado.",
+      detail:
+        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /memory/:id/photo.",
     });
-  } catch (err) {
-    return next(err);
-  }
-});
+  });
 
-function compareFeedDescDeterministic(a, b) {
-  const da = safeDateMs(a?.date) ?? -Infinity;
-  const db = safeDateMs(b?.date) ?? -Infinity;
+  app.post("/api/memory/:id/photo", authenticate, (_req, res) => {
+    return res.status(501).json({
+      error: "Upload não habilitado.",
+      detail:
+        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/memory/:id/photo.",
+    });
+  });
 
-  if (da !== db) return db - da;
+  app.post("/memory/:id/audio", authenticate, (_req, res) => {
+    return res.status(501).json({
+      error: "Upload não habilitado.",
+      detail:
+        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /memory/:id/audio.",
+    });
+  });
 
-  const order = { chapter: 0, memory: 1 };
-  const ta = order[a?.type] ?? 99;
-  const tb = order[b?.type] ?? 99;
-  if (ta !== tb) return ta - tb;
-
-  const sa = String(a?.source_id ?? "");
-  const sb = String(b?.source_id ?? "");
-  if (sa < sb) return -1;
-  if (sa > sb) return 1;
-  return 0;
-}
-
-function compareFeedV01(a, b) {
-  const sa = Number(a?.score ?? 0);
-  const sb = Number(b?.score ?? 0);
-  if (sa !== sb) return sb - sa;
-
-  const da = safeDateMs(a?.activity_at) ?? -Infinity;
-  const db = safeDateMs(b?.activity_at) ?? -Infinity;
-  if (da !== db) return db - da;
-
-  const ka = String(a?.kind ?? "");
-  const kb = String(b?.kind ?? "");
-  if (ka !== kb) return ka < kb ? -1 : 1;
-
-  const ida = String(a?.object?.id ?? "");
-  const idb = String(b?.object?.id ?? "");
-  if (ida < idb) return -1;
-  if (ida > idb) return 1;
-
-  const aa = String(a?.activity_at ?? "");
-  const ab = String(b?.activity_at ?? "");
-  if (aa < ab) return -1;
-  if (aa > ab) return 1;
-
-  return 0;
-}
-
-function hashStringToInt(input) {
-  const s = String(input ?? "");
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-function prng01(seed) {
-  let x = (seed >>> 0) || 123456789;
-  x = (Math.imul(1664525, x) + 1013904223) >>> 0;
-  return x / 4294967296;
-}
-
-function actionWeight(action) {
-  const a = String(action || "").toLowerCase();
-  if (a === "published") return 40;
-  if (a === "created") return 20;
-  if (a === "updated") return 10;
-  return 0;
-}
-
-function kindBoost(kind) {
-  const k = String(kind || "").toLowerCase();
-  if (k === "chapter") return 15;
-  if (k === "memory") return 10;
-  if (k === "version") return 5;
-  return 0;
-}
-
-function computeRecencyScore(activityAtIso) {
-  const now = Date.now();
-  const ms = safeDateMs(activityAtIso);
-  const ageMin = typeof ms === "number" ? Math.max(0, (now - ms) / 60000) : 999999;
-
-  const x = ageMin;
-  const s = 900 / (1 + x / 240);
-  return Math.max(0, Math.floor(s));
-}
-
-function socialSignalScore(counts) {
-  const c = counts || {};
-  const likes = Number(c.likes || 0);
-  const comments = Number(c.comments || 0);
-  const reposts = Number(c.reposts || 0);
-  const saves = Number(c.saves || 0);
-  const raw = likes * 3 + comments * 12 + reposts * 16 + saves * 10;
-  return Math.max(0, Math.min(250, raw));
-}
-
-function computeScoreVNext({ kind, action, activity_at, social }) {
-  const rec = computeRecencyScore(activity_at);
-  const aw = actionWeight(action);
-  const kb = kindBoost(kind);
-  const ss = socialSignalScore(social?.counts);
-  return rec + aw + kb + ss;
-}
-
-function normalizeV01Action(kind, meta) {
-  const k = String(kind || "").toLowerCase();
-  if (k === "chapter") {
-    const st = String(meta?.status ?? "").toLowerCase();
-    if (st === "published") return "published";
-    if (meta?.published_at) return "published";
-    return "created";
-  }
-  if (k === "memory") {
-    const src = String(meta?.date_source ?? "").toLowerCase();
-    if (src === "activity_at") return "updated";
-    return "created";
-  }
-  if (k === "version") return "updated";
-  return "created";
-}
-
-function buildSocialBlockStubVNext({ seedKey, action, kind }) {
-  const verbMap = {
-    published: "publicou",
-    created: "criou",
-    updated: "atualizou",
-  };
-  const verb = verbMap[String(action || "").toLowerCase()] || "movimentou";
-
-  const seed = hashStringToInt(`${seedKey}|${action}|${kind}`);
-  const r1 = prng01(seed);
-  const r2 = prng01(seed ^ 0x9e3779b9);
-  const r3 = prng01(seed ^ 0x85ebca6b);
-
-  const likes = Math.floor(r1 * 18);
-  const comments = Math.floor(r2 * 6);
-  const reposts = Math.floor(r3 * 4);
-  const saves = Math.floor(prng01(seed ^ 0xc2b2ae35) * 8);
-
-  const poolNames = [
-    "Ana Silva",
-    "João Lima",
-    "Maria Souza",
-    "Pedro Santos",
-    "Bruno Almeida",
-    "Lucas Vieira",
-    "Carla Nunes",
-    "Rafael Costa",
-    "Juliana Rocha",
-    "Fernanda Dias",
-  ];
-
-  const pickCount = Math.max(0, Math.min(3, Math.floor(prng01(seed ^ 0x27d4eb2d) * 4)));
-  const people = [];
-  for (let i = 0; i < pickCount; i++) {
-    const idx = Math.floor(prng01(seed ^ (i * 1315423911)) * poolNames.length);
-    people.push({ name: poolNames[idx] });
-  }
-
-  const friendOf = prng01(seed ^ 0x165667b1) > 0.72 ? { label: "conhecido de você" } : null;
-
-  return {
-    friendOf,
-    people,
-    verb,
-    counts: { likes, comments, reposts, saves },
-  };
+  app.post("/api/memory/:id/audio", authenticate, (_req, res) => {
+    return res.status(501).json({
+      error: "Upload não habilitado.",
+      detail:
+        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/memory/:id/audio.",
+    });
+  });
 }
 
 async function handleFeed(req, res, next) {
   try {
-    const authorIdRaw = req.user?.author_id;
-    const authorId = Number(authorIdRaw);
-
-    if (!Number.isInteger(authorId) || authorId <= 0) {
+    const viewerId = getAuthorIdFromToken(req);
+    if (!viewerId) {
       return res.status(401).json({ error: "Não autenticado." });
     }
 
-    const limit = clampInt(req.query?.limit, 1, 50, 20);
+    const limit = clampInt(req.query?.limit, 1, 100, 20);
     const v = String(req.query?.v ?? "").trim().toLowerCase();
 
     const pool = await getPool();
 
     const profR = await pool
       .request()
-      .input("author_id", sql.Int, authorId)
+      .input("author_id", sql.Int, viewerId)
       .query(`
         SELECT TOP 1
           a.author_id,
@@ -901,134 +1412,327 @@ async function handleFeed(req, res, next) {
       null;
 
     const profileLegacy = {
-      author_id: authorId,
+      author_id: viewerId,
       author_code: authorCode,
       display_name: displayNameRaw || authorCode || null,
       preferred_language: pr?.preferred_language ? String(pr.preferred_language) : null,
     };
 
     const actorV01 = {
-      author_id: authorId,
+      author_id: viewerId,
       name_public: namePublic,
       avatar_url: pr?.avatar_url != null ? String(pr.avatar_url) : null,
     };
 
-    const memR = await pool
+    const feedR = await pool
       .request()
-      .input("author_id", sql.Int, authorId)
+      .input("viewer_author_id", sql.Int, viewerId)
+      .input("limit", sql.Int, limit)
       .query(`
-        SELECT
-          m.memory_id,
-          m.title,
-          m.content,
-          m.created_at AS memory_created_at,
-          v.last_version_at,
-          p.phase_code AS life_phase,
-          mc.chapter_id
-        FROM dbo.identity_memory m
-        LEFT JOIN dbo.identity_memory_chapter mc
-          ON mc.memory_id = m.memory_id
-        LEFT JOIN dbo.identity_phase p
-          ON p.phase_id = m.phase_id
-        OUTER APPLY (
-          SELECT TOP 1 created_at AS last_version_at
-          FROM dbo.identity_memory_versions vv
-          WHERE vv.memory_id = m.memory_id
-          ORDER BY vv.version_number DESC, vv.created_at DESC
-        ) v
-        WHERE m.author_id = @author_id
-          AND ISNULL(m.is_deleted, 0) = 0;
+        WITH viewer_network AS (
+          SELECT
+            a.author_id,
+            CAST('self' AS varchar(20)) AS relationship_type,
+            CAST('self' AS varchar(20)) AS origin_scope,
+            CAST(1000 AS int) AS relationship_score
+          FROM dbo.identity_author a
+          WHERE a.author_id = @viewer_author_id
+
+          UNION ALL
+
+          SELECT
+            f.followed_id AS author_id,
+            CAST(
+              CASE
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM dbo.identity_follow rf
+                  WHERE rf.follower_id = f.followed_id
+                    AND rf.followed_id = @viewer_author_id
+                )
+                THEN 'mutual'
+                ELSE 'following'
+              END
+              AS varchar(20)
+            ) AS relationship_type,
+            CAST(
+              CASE
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM dbo.identity_follow rf
+                  WHERE rf.follower_id = f.followed_id
+                    AND rf.followed_id = @viewer_author_id
+                )
+                THEN 'connection'
+                ELSE 'following'
+              END
+              AS varchar(20)
+            ) AS origin_scope,
+            CAST(
+              CASE
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM dbo.identity_follow rf
+                  WHERE rf.follower_id = f.followed_id
+                    AND rf.followed_id = @viewer_author_id
+                )
+                THEN 700
+                ELSE 400
+              END
+              AS int
+            ) AS relationship_score
+          FROM dbo.identity_follow f
+          WHERE f.follower_id = @viewer_author_id
+        ),
+        dedup_viewer_network AS (
+          SELECT
+            vn.author_id,
+            vn.relationship_type,
+            vn.origin_scope,
+            vn.relationship_score
+          FROM (
+            SELECT
+              vn.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY vn.author_id
+                ORDER BY vn.relationship_score DESC, vn.author_id ASC
+              ) AS rn
+            FROM viewer_network vn
+          ) vn
+          WHERE vn.rn = 1
+        ),
+        network_authors AS (
+          SELECT
+            vn.author_id,
+            vn.relationship_type,
+            vn.origin_scope,
+            vn.relationship_score,
+            ia.author_code,
+            COALESCE(
+              NULLIF(LTRIM(RTRIM(CONVERT(varchar(200), ia.name_public))), ''),
+              NULLIF(LTRIM(RTRIM(CONVERT(varchar(200), ia.full_name))), ''),
+              NULLIF(LTRIM(RTRIM(CONVERT(varchar(200), ia.author_code))), '')
+            ) AS author_name
+          FROM dedup_viewer_network vn
+          INNER JOIN dbo.identity_author ia
+            ON ia.author_id = vn.author_id
+        ),
+        memory_feed AS (
+          SELECT
+            CAST('memory' AS varchar(20)) AS item_type,
+            CAST(m.memory_id AS varchar(50)) AS source_id,
+            m.author_id,
+            na.author_name,
+            na.author_code,
+            na.relationship_type,
+            na.origin_scope,
+            na.relationship_score,
+            m.title AS title,
+            m.published_at AS activity_at,
+            CONCAT('/memories/', CAST(m.memory_id AS varchar(50))) AS nav,
+            m.content AS preview_text,
+            p.phase_code AS phase_code,
+            COALESCE(
+              NULLIF(LTRIM(RTRIM(CONVERT(varchar(1000), m.photo_url))), ''),
+              CONCAT('/cdn/memories/', CAST(m.author_id AS varchar(50)), '/', CAST(m.memory_id AS varchar(50)))
+            ) AS photo_url,
+            CONVERT(varchar(50), m.publication_status) AS publication_status_raw,
+            m.published_at AS published_at,
+            CAST(NULL AS int) AS chapter_id,
+            CAST(m.memory_id AS int) AS memory_id,
+            CAST(
+              na.relationship_score
+              + 120
+              + CASE WHEN m.published_at IS NOT NULL THEN 50 ELSE 0 END
+              AS int
+            ) AS relevance_score
+          FROM dbo.identity_memory m
+          INNER JOIN network_authors na
+            ON na.author_id = m.author_id
+          LEFT JOIN dbo.identity_phase p
+            ON p.phase_id = m.phase_id
+          WHERE ISNULL(m.is_deleted, 0) = 0
+            AND UPPER(LTRIM(RTRIM(ISNULL(CONVERT(varchar(50), m.publication_status), '')))) = 'PUBLISHED'
+            AND m.published_at IS NOT NULL
+        ),
+        chapter_feed AS (
+          SELECT
+            CAST('chapter' AS varchar(20)) AS item_type,
+            CAST(c.chapter_id AS varchar(50)) AS source_id,
+            c.author_id,
+            na.author_name,
+            na.author_code,
+            na.relationship_type,
+            na.origin_scope,
+            na.relationship_score,
+            c.title AS title,
+            c.published_at AS activity_at,
+            '/chapters' AS nav,
+            COALESCE(c.description, c.title, '') AS preview_text,
+            CAST(NULL AS varchar(50)) AS phase_code,
+            CAST(NULL AS varchar(500)) AS photo_url,
+            CASE
+              WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
+                THEN COALESCE(
+                  NULLIF(LTRIM(RTRIM(CONVERT(varchar(50), c.publication_status))), ''),
+                  CONVERT(varchar(50), c.status)
+                )
+              ELSE CONVERT(varchar(50), c.status)
+            END AS publication_status_raw,
+            c.published_at AS published_at,
+            CAST(c.chapter_id AS int) AS chapter_id,
+            CAST(NULL AS int) AS memory_id,
+            CAST(
+              na.relationship_score
+              + 220
+              + CASE WHEN c.published_at IS NOT NULL THEN 50 ELSE 0 END
+              AS int
+            ) AS relevance_score
+          FROM dbo.identity_chapter c
+          INNER JOIN network_authors na
+            ON na.author_id = c.author_id
+          WHERE ISNULL(c.is_deleted, 0) = 0
+            AND UPPER(
+              LTRIM(RTRIM(
+                CASE
+                  WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
+                    THEN COALESCE(
+                      NULLIF(CONVERT(varchar(50), c.publication_status), ''),
+                      CONVERT(varchar(50), c.status)
+                    )
+                  ELSE CONVERT(varchar(50), c.status)
+                END
+              ))
+            ) IN ('PUBLIC', 'PUBLISHED', 'SHARED')
+            AND c.published_at IS NOT NULL
+        ),
+        unified AS (
+          SELECT * FROM memory_feed
+          UNION ALL
+          SELECT * FROM chapter_feed
+        )
+        SELECT TOP (@limit)
+          item_type,
+          source_id,
+          author_id,
+          author_name,
+          author_code,
+          relationship_type,
+          origin_scope,
+          relationship_score,
+          relevance_score,
+          title,
+          activity_at,
+          nav,
+          preview_text,
+          phase_code,
+          photo_url,
+          publication_status_raw,
+          published_at,
+          chapter_id,
+          memory_id
+        FROM unified
+        ORDER BY
+          relevance_score DESC,
+          activity_at DESC,
+          source_id DESC;
       `);
 
-    const memoriesLegacy = (memR.recordset || []).map((m) => {
-      const memoryId = Number(m.memory_id);
-      const title = normalizeText(m.title, "(Memória sem título)");
+    const rows = feedR.recordset || [];
 
-      const a1 = safeDateMs(m.memory_created_at);
-      const a2 = safeDateMs(m.last_version_at);
-      const bestMs =
-        typeof a1 === "number" && typeof a2 === "number"
-          ? Math.max(a1, a2)
-          : typeof a2 === "number"
-          ? a2
-          : typeof a1 === "number"
-          ? a1
-          : Date.now();
+    const legacyItems = rows.map((row) => {
+      const itemType = String(row.item_type || "").toLowerCase();
+      const sourceId = String(row.source_id ?? "");
+      const title = normalizeText(
+        row.title,
+        itemType === "chapter" ? "(Capítulo sem título)" : "(Memória sem título)"
+      );
+      const activityIso = normalizeIsoOrNow(row.activity_at || row.published_at);
+      const publicationStatus =
+        row.publication_status_raw != null ? String(row.publication_status_raw) : null;
+      const authorName = row.author_name != null ? String(row.author_name) : null;
+      const authorCodeRow = row.author_code != null ? String(row.author_code) : null;
 
-      const activityAtIso = new Date(bestMs).toISOString();
-
-      const preview = makePreview(m.content, 120);
-      const phaseCode = m.life_phase ? String(m.life_phase) : null;
-      const chapterId = m.chapter_id != null ? Number(m.chapter_id) : null;
+      if (itemType === "chapter") {
+        return {
+          type: "chapter",
+          title,
+          date: activityIso,
+          source_id: sourceId,
+          authorId: row.author_id != null ? Number(row.author_id) : null,
+          authorName,
+          authorCode: authorCodeRow,
+          relationshipType: row.relationship_type != null ? String(row.relationship_type) : null,
+          originScope: row.origin_scope != null ? String(row.origin_scope) : null,
+          relevanceScore: row.relevance_score != null ? Number(row.relevance_score) : null,
+          meta: {
+            nav: row.nav || "/chapters",
+            date_source: "published_at",
+            activity_at: activityIso,
+            preview: makePreview(row.preview_text, 260) || undefined,
+            publication_status: publicationStatus || undefined,
+            published_at: row.published_at ? normalizeIsoOrNow(row.published_at) : null,
+            chapter_id: row.chapter_id != null ? Number(row.chapter_id) : undefined,
+            memory_id: undefined,
+            status: publicationStatus || undefined,
+            description: makePreview(row.preview_text, 260) || undefined,
+            author_id: row.author_id != null ? Number(row.author_id) : undefined,
+            author_name: authorName || undefined,
+            author_code: authorCodeRow || undefined,
+            relationship_type:
+              row.relationship_type != null ? String(row.relationship_type) : undefined,
+            origin_scope: row.origin_scope != null ? String(row.origin_scope) : undefined,
+            relevance_score:
+              row.relevance_score != null ? Number(row.relevance_score) : undefined,
+          },
+        };
+      }
 
       return {
         type: "memory",
         title,
-        date: activityAtIso,
-        source_id: String(memoryId),
-        meta: {
-          nav: mkNav("memory", memoryId),
-          date_source: "activity_at",
-          activity_at: activityAtIso,
-          preview: preview || undefined,
-          phase_code: phaseCode || undefined,
-          chapter_id: Number.isInteger(chapterId) ? chapterId : undefined,
-        },
-      };
-    });
-
-    const chapR = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .query(`
-        SELECT
-          c.chapter_id,
-          c.title,
-          c.description,
-          c.created_at,
-          c.updated_at,
-          c.published_at,
-          c.status
-        FROM dbo.identity_chapter c
-        WHERE c.author_id = @author_id
-          AND ISNULL(c.is_deleted, 0) = 0;
-      `);
-
-    const chaptersLegacy = (chapR.recordset || []).map((c) => {
-      const chapterId = Number(c.chapter_id);
-      const title = normalizeText(c.title, "(Capítulo sem título)");
-
-      const activityIso = normalizeIsoOrNow(c.published_at ?? c.updated_at ?? c.created_at);
-
-      const description = normalizeText(c.description, "");
-      const descriptionPreview = makePreview(description, 140);
-
-      return {
-        type: "chapter",
-        title,
         date: activityIso,
-        source_id: String(chapterId),
+        source_id: sourceId,
+        photoUrl: row.photo_url != null ? String(row.photo_url) : null,
+        authorId: row.author_id != null ? Number(row.author_id) : null,
+        authorName,
+        authorCode: authorCodeRow,
+        relationshipType: row.relationship_type != null ? String(row.relationship_type) : null,
+        originScope: row.origin_scope != null ? String(row.origin_scope) : null,
+        relevanceScore: row.relevance_score != null ? Number(row.relevance_score) : null,
         meta: {
-          nav: mkNav("chapter", chapterId),
-          date_source: "activity_at",
+          nav: row.nav || mkNav("memory", row.memory_id ?? row.source_id),
+          date_source: "published_at",
           activity_at: activityIso,
-          status: c.status ?? null,
-          published_at: c.published_at ?? null,
-          description: descriptionPreview || undefined,
+          preview: makePreview(row.preview_text, 220) || undefined,
+          phase_code: row.phase_code != null ? String(row.phase_code) : undefined,
+          photo_url: row.photo_url != null ? String(row.photo_url) : undefined,
+          publication_status: publicationStatus || undefined,
+          published_at: row.published_at ? normalizeIsoOrNow(row.published_at) : null,
+          memory_id: row.memory_id != null ? Number(row.memory_id) : undefined,
+          chapter_id: undefined,
+          status: publicationStatus || undefined,
+          author_id: row.author_id != null ? Number(row.author_id) : undefined,
+          author_name: authorName || undefined,
+          author_code: authorCodeRow || undefined,
+          relationship_type:
+            row.relationship_type != null ? String(row.relationship_type) : undefined,
+          origin_scope: row.origin_scope != null ? String(row.origin_scope) : undefined,
+          relevance_score:
+            row.relevance_score != null ? Number(row.relevance_score) : undefined,
         },
       };
     });
 
-    const allLegacy = [...chaptersLegacy, ...memoriesLegacy].sort(compareFeedDescDeterministic);
-    const legacyItems = allLegacy.slice(0, limit);
+    const memoryCount = legacyItems.filter((x) => x.type === "memory").length;
+    const chapterCount = legacyItems.filter((x) => x.type === "chapter").length;
 
     const wantsV01 = v === "0.1" || v === "v0.1" || v === "1";
 
     if (wantsV01) {
-      const v01Candidates = (allLegacy || []).map((it) => {
+      const v01Items = legacyItems.map((it) => {
         const kind = String(it.type || "").toLowerCase();
         const activityAt = it?.meta?.activity_at || it?.date || new Date().toISOString();
-        const action = normalizeV01Action(kind, it?.meta);
 
         const idNum = Number(it?.source_id);
         const id = Number.isFinite(idNum) && idNum > 0 ? idNum : String(it?.source_id ?? "");
@@ -1039,38 +1743,37 @@ async function handleFeed(req, res, next) {
           title: normalizeText(it?.title, "(sem título)"),
           nav: it?.meta?.nav || "/",
           preview: it?.meta?.preview || it?.meta?.description || null,
+          photoUrl: it?.photoUrl ?? it?.meta?.photo_url ?? null,
           meta: {
             phase_code: it?.meta?.phase_code ?? null,
             chapter_id: it?.meta?.chapter_id ?? null,
             status: it?.meta?.status ?? null,
+            publication_status: it?.meta?.publication_status ?? null,
             published_at: it?.meta?.published_at ?? null,
+            photo_url: it?.meta?.photo_url ?? null,
+            author_id: it?.meta?.author_id ?? it?.authorId ?? null,
+            author_name: it?.meta?.author_name ?? it?.authorName ?? null,
+            author_code: it?.meta?.author_code ?? it?.authorCode ?? null,
+            relationship_type: it?.meta?.relationship_type ?? it?.relationshipType ?? null,
+            origin_scope: it?.meta?.origin_scope ?? it?.originScope ?? null,
+            relevance_score: it?.meta?.relevance_score ?? it?.relevanceScore ?? null,
           },
         };
 
         const activityIso = new Date(safeDateMs(activityAt) ?? Date.now()).toISOString();
 
-        const seedKey = `${kind}:${String(obj.id)}`;
-        const social = buildSocialBlockStubVNext({ seedKey, action, kind });
-
-        const score = computeScoreVNext({
-          kind,
-          action,
-          activity_at: activityIso,
-          social,
-        });
-
         return {
-          actor: actorV01,
+          actor: {
+            author_id: it?.meta?.author_id ?? it?.authorId ?? actorV01.author_id,
+            name_public: it?.meta?.author_name ?? it?.authorName ?? actorV01.name_public,
+            avatar_url: null,
+          },
           kind,
-          action,
+          action: "published",
           activity_at: activityIso,
           object: obj,
-          social,
-          score,
         };
       });
-
-      const v01Items = v01Candidates.sort(compareFeedV01).slice(0, limit);
 
       return res.json({
         version: "FEED_v0.1",
@@ -1079,13 +1782,14 @@ async function handleFeed(req, res, next) {
         meta: {
           generated_at: new Date().toISOString(),
           limit,
-          ranking: "MOVE_D(recency + action_weight + social_signal)",
-          weights: {
-            action: { published: 40, created: 20, updated: 10 },
-            social: { like: 3, comment: 12, repost: 16, save: 10 },
-          },
+          truth_mode: "published_only",
+          scope_mode: "self_and_network",
+          ordering_mode: "relevance_then_recency",
           summary: {
-            counts: { memories: memoriesLegacy.length, chapters: chaptersLegacy.length },
+            counts: {
+              memories: memoryCount,
+              chapters: chapterCount,
+            },
           },
         },
         legacy: {
@@ -1101,7 +1805,15 @@ async function handleFeed(req, res, next) {
       meta: {
         generated_at: new Date().toISOString(),
         limit,
-        summary: { counts: { memories: memoriesLegacy.length, chapters: chaptersLegacy.length } },
+        truth_mode: "published_only",
+        scope_mode: "self_and_network",
+        ordering_mode: "relevance_then_recency",
+        summary: {
+          counts: {
+            memories: memoryCount,
+            chapters: chapterCount,
+          },
+        },
       },
     });
   } catch (err) {
@@ -1123,14 +1835,22 @@ console.log("[ROUTE] OK /timeline");
 console.log("[ROUTE] OK /api/timeline (alias)");
 console.log("[ROUTE] OK /feed");
 console.log("[ROUTE] OK /api/feed (alias)");
+console.log("[ROUTE] OK /network");
+console.log("[ROUTE] OK /api/network");
 console.log("[ROUTE] OK /profile (PUT) [legacy]");
 console.log("[ROUTE] OK /me/profile (GET,PUT) [PROFILE_v1]");
 console.log("[ROUTE] OK /api/me/profile (GET,PUT) [alias]");
 console.log("[ROUTE] OK /me/avatar (POST multipart) [PROFILE_v1]");
 console.log("[ROUTE] OK /api/me/avatar (POST multipart) [alias]");
+console.log("[ROUTE] OK /memory/:id/photo (POST multipart) [MEMORY_v1]");
+console.log("[ROUTE] OK /api/memory/:id/photo (POST multipart) [alias]");
+console.log("[ROUTE] OK /memory/:id/audio (POST multipart) [MEMORY_AUDIO_v1]");
+console.log("[ROUTE] OK /api/memory/:id/audio (POST multipart) [alias]");
 console.log("[ROUTE] OK /authors/:id/profile (GET) [PROFILE_v1]");
 console.log("[ROUTE] OK /api/authors/:id/profile (GET) [alias]");
 console.log("[ROUTE] OK /cdn/avatars/:authorId/avatar (canônico, sem extensão)");
+console.log("[ROUTE] OK /cdn/memories/:authorId/:memoryId (canônico, sem extensão)");
+console.log("[ROUTE] OK /cdn/memory-media/:authorId/:memoryId/:mediaId/:variant (canônico)");
 console.log("[ROUTE] OK /cdn/* (static) [MVP CDN local]");
 console.log("[ROUTE] OK /health");
 console.log("[ROUTE] OK / (root)");
@@ -1152,6 +1872,8 @@ app.use((err, _req, res, _next) => {
 console.log("[BOOT] server file:", __filename);
 console.log("[BOOT] PUBLIC_DIR:", PUBLIC_DIR);
 console.log("[BOOT] AVATARS_DIR:", AVATARS_DIR);
+console.log("[BOOT] MEMORIES_DIR:", MEMORIES_DIR);
+console.log("[BOOT] MEMORY_MEDIA_DIR:", MEMORY_MEDIA_DIR);
 console.log(
   "[BOOT] has CDN avatar route:",
   typeof app._router?.stack?.find?.((r) => r?.route?.path === "/cdn/avatars/:authorId/avatar") !==

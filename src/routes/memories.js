@@ -3,10 +3,10 @@
 // - POST /memories                      -> (contrato) payload { content: string }
 // - GET  /memories                      -> inventário simples (items) + payload legado (memories)
 // - GET  /authors/:authorId/memories
-// - POST /authors/:authorId/memories     -> dbo.p_CreateMemory_WithVersion
+// - POST /authors/:authorId/memories    -> dbo.p_CreateMemory_WithVersion
 // - GET  /memories/:id
 // - GET  /memories/:id/versions
-// - PUT  /memories/:id                   -> dbo.p_UpdateMemory_WithVersion
+// - PUT  /memories/:id                  -> dbo.p_UpdateMemory_WithVersion
 
 import express from "express";
 import { authenticate } from "../middleware/auth.js";
@@ -203,9 +203,9 @@ function makePreview(text, maxLen = 120) {
 }
 
 // ✅ select com phase meta
+// ✅ inclui campos editoriais
 // ⚠️ IMPORTANTE: não usar LEFT JOIN direto em identity_memory_chapter,
 // porque múltiplas linhas por memory_id multiplicam o resultado (duplicidade).
-// Usamos OUTER APPLY TOP 1 para garantir 1 chapter_id por memória.
 async function selectMemoryById(pool, memoryId) {
   const r = await pool
     .request()
@@ -222,6 +222,9 @@ async function selectMemoryById(pool, memoryId) {
         m.content,
         m.created_at,
         m.version_number,
+        m.publication_status,
+        m.published_at,
+        m.published_version_number,
         m.is_deleted
       FROM dbo.identity_memory m
       OUTER APPLY (
@@ -254,6 +257,9 @@ async function listMemoriesByAuthor(pool, authorId, req) {
         m.content,
         m.created_at,
         m.version_number,
+        m.publication_status,
+        m.published_at,
+        m.published_version_number,
         m.is_deleted
       FROM dbo.identity_memory m
       OUTER APPLY (
@@ -266,10 +272,16 @@ async function listMemoriesByAuthor(pool, authorId, req) {
         ON p.phase_id = m.phase_id
       WHERE m.author_id = @author_id
         AND ISNULL(m.is_deleted, 0) = 0
-      ORDER BY m.created_at DESC, m.memory_id DESC;
+      ORDER BY
+        CASE
+          WHEN UPPER(LTRIM(RTRIM(ISNULL(CONVERT(varchar(50), m.publication_status), 'DRAFT')))) = 'PUBLISHED'
+            THEN 0
+          ELSE 1
+        END ASC,
+        ISNULL(m.published_at, m.created_at) DESC,
+        m.memory_id DESC;
     `);
 
-  // ✅ Dedupe defensivo por memory_id (caso o banco esteja “sujo”)
   const seen = new Set();
   const out = [];
   for (const r of result.recordset || []) {
@@ -318,7 +330,6 @@ router.post("/memories", authenticate, async (req, res) => {
     request.input("UserId", sql.Int, userId);
     request.input("UserCode", sql.NVarChar(100), userCode);
 
-    // create legado não aceita fase aqui (contrato fechado)
     const result = await request.execute("dbo.p_CreateMemory_WithVersion");
     const row = result?.recordset?.[0];
     if (!row) return res.status(500).json({ error: "Erro ao criar memória." });
@@ -335,7 +346,6 @@ router.post("/memories", authenticate, async (req, res) => {
 });
 
 // ✅ GET /memories — inventário para modal + mantém legado
-// - resolve o 404 do frontend quando este chama /memories ou /api/memories
 router.get("/memories", authenticate, async (req, res) => {
   try {
     const authorId = Number(req.user?.author_id);
@@ -349,7 +359,6 @@ router.get("/memories", authenticate, async (req, res) => {
     const pool = await getPool();
     const rows = await listMemoriesByAuthor(pool, authorId, req);
 
-    // ✅ Inventário simples (o que o modal precisa)
     const items = (rows || []).map((m) => {
       const id = Number(m?.memory_id);
       const title = normalizeText(m?.title, "(Memória sem título)");
@@ -358,12 +367,12 @@ router.get("/memories", authenticate, async (req, res) => {
         id,
         title,
         excerpt: excerpt || null,
+        publication_status: m?.publication_status ?? "DRAFT",
+        published_at: m?.published_at ?? null,
+        published_version_number: m?.published_version_number ?? null,
       };
     });
 
-    // ✅ Resposta híbrida:
-    // - items: contrato leve para modal
-    // - memories: payload legado (para compat / debug / telas existentes)
     return res.json({
       author_id: authorId,
       items,
@@ -371,7 +380,7 @@ router.get("/memories", authenticate, async (req, res) => {
       meta: {
         count: items.length,
         generated_at: new Date().toISOString(),
-        contract: "MEMORIES_INVENTORY_v0.1 (items) + legacy(memories)",
+        contract: "MEMORIES_INVENTORY_v0.2 (items + editorial fields) + legacy(memories)",
       },
     });
   } catch (err) {
@@ -400,8 +409,7 @@ router.get("/authors/:authorId/memories", authenticate, async (req, res) => {
   }
 });
 
-// POST /authors/:authorId/memories (aceita chapter + fase)
-// IMPORTANTE: NÃO passa PhaseId para proc (contrato estável). Aplica fase em UPDATE separado.
+// POST /authors/:authorId/memories
 router.post("/authors/:authorId/memories", authenticate, async (req, res) => {
   try {
     const authorId = Number(req.params.authorId);
@@ -430,7 +438,6 @@ router.post("/authors/:authorId/memories", authenticate, async (req, res) => {
     const pool = await getPool();
     await trySetSessionContext(pool, userCode);
 
-    // fase: aceita phase_id direto OU life_phase flexível
     const phaseIdDirectRaw = parsePhaseIdDirect(req.body || {});
     const lifePhaseCodeParsed = parseLifePhaseFlexible(req.body || {});
 
@@ -441,19 +448,16 @@ router.post("/authors/:authorId/memories", authenticate, async (req, res) => {
     request.input("UserId", sql.Int, userId);
     request.input("UserCode", sql.NVarChar(100), userCode);
 
-    // NÃO envia PhaseId na proc (contrato estável)
     const result = await request.execute("dbo.p_CreateMemory_WithVersion");
     const row = result?.recordset?.[0];
     if (!row) return res.status(500).json({ error: "Falha ao criar memória." });
 
     const createdId = Number(row.memory_id);
 
-    // aplica chapter link (opcional)
     if (Number.isInteger(createdId) && createdId > 0 && chapterIdParsed !== undefined) {
       await updateMemoryChapterLink(pool, createdId, authorId, chapterIdParsed);
     }
 
-    // aplica fase (opcional) — UPDATE separado
     if (Number.isInteger(createdId) && createdId > 0) {
       if (phaseIdDirectRaw !== undefined) {
         if (phaseIdDirectRaw === null) {
@@ -553,8 +557,7 @@ router.get(
   }
 );
 
-// PUT /memories/:id (aceita chapter + fase)
-// IMPORTANTE: NÃO passa PhaseId na proc (contrato estável). Aplica fase em UPDATE separado.
+// PUT /memories/:id
 router.put("/memories/:id", authenticate, async (req, res) => {
   try {
     const memoryId = Number(req.params.id);
@@ -590,7 +593,6 @@ router.put("/memories/:id", authenticate, async (req, res) => {
 
     await trySetSessionContext(pool, userCode);
 
-    // fase: aceita phase_id direto OU life_phase flexível
     const phaseIdDirectRaw = parsePhaseIdDirect(req.body || {});
     const lifePhaseCodeParsed = parseLifePhaseFlexible(req.body || {});
 
@@ -602,15 +604,12 @@ router.put("/memories/:id", authenticate, async (req, res) => {
     request.input("AuthorId", sql.Int, authorId);
     request.input("UserCode", sql.NVarChar(100), userCode);
 
-    // NÃO envia PhaseId na proc (contrato estável)
     await request.execute("dbo.p_UpdateMemory_WithVersion");
 
-    // chapter link
     if (chapterIdParsed !== undefined) {
       await updateMemoryChapterLink(pool, memoryId, authorId, chapterIdParsed);
     }
 
-    // aplica fase (UPDATE separado)
     if (phaseIdDirectRaw !== undefined) {
       if (phaseIdDirectRaw === null) {
         await updateMemoryPhase(pool, memoryId, authorId, null);

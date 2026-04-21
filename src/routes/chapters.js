@@ -28,18 +28,38 @@ function ensureAuthorId(req, res) {
   return Number(authorId);
 }
 
+function normalizePublicationStatus(value) {
+  const s = String(value ?? "").trim().toUpperCase();
+
+  if (s === "PUBLISHED" || s === "PUBLIC" || s === "SHARED") {
+    return "PUBLIC";
+  }
+
+  return "DRAFT";
+}
+
 function normalizeChapterRow(r) {
   if (!r) return null;
+
+  const publicationStatus = normalizePublicationStatus(
+    r.publication_status ??
+      r.publication_status_effective ??
+      r.status
+  );
+
   return {
     chapter_id: r.chapter_id,
     author_id: r.author_id,
     title: r.title,
     description: r.description,
-    status: r.status,
+    status: publicationStatus,
+    publication_status: publicationStatus,
     current_version_id: r.current_version_id,
     created_at: r.created_at,
     updated_at: r.updated_at,
-    published_at: r.published_at,
+    published_at: publicationStatus === "PUBLIC" ? r.published_at ?? null : null,
+    published_version_number:
+      r.published_version_number != null ? Number(r.published_version_number) : null,
   };
 }
 
@@ -208,11 +228,27 @@ async function listExistingChapters(pool, authorId) {
     .query(`
       SELECT
         chapter_id,
+        author_id,
         title,
+        description,
+        current_version_id,
         status,
+        CASE
+          WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
+            THEN COALESCE(
+              NULLIF(LTRIM(RTRIM(CONVERT(varchar(50), publication_status))), ''),
+              CONVERT(varchar(50), status)
+            )
+          ELSE CONVERT(varchar(50), status)
+        END AS publication_status_effective,
         created_at,
         updated_at,
-        published_at
+        published_at,
+        CASE
+          WHEN COL_LENGTH('dbo.identity_chapter', 'published_version_number') IS NOT NULL
+            THEN published_version_number
+          ELSE NULL
+        END AS published_version_number
       FROM dbo.identity_chapter
       WHERE author_id = @author_id
         AND ISNULL(is_deleted,0) = 0
@@ -223,14 +259,7 @@ async function listExistingChapters(pool, authorId) {
         chapter_id DESC;
     `);
 
-  return (r?.recordset || []).map((x) => ({
-    chapter_id: Number(x.chapter_id),
-    title: x.title != null ? String(x.title) : null,
-    status: x.status != null ? String(x.status) : null,
-    created_at: x.created_at ?? null,
-    updated_at: x.updated_at ?? null,
-    published_at: x.published_at ?? null,
-  }));
+  return (r?.recordset || []).map((x) => normalizeChapterRow(x));
 }
 
 async function getChapterDetailForApply(pool, authorId, chapterId) {
@@ -473,19 +502,119 @@ async function getMoveSourceLink(pool, authorId, memoryId, targetChapterId, expl
   return fallback?.recordset?.[0] || null;
 }
 
+async function getChapterEditorialState(pool, authorId, chapterId) {
+  const result = await pool
+    .request()
+    .input("author_id", sql.Int, authorId)
+    .input("chapter_id", sql.Int, chapterId)
+    .query(`
+      SELECT TOP 1
+        c.chapter_id,
+        c.author_id,
+        c.title,
+        c.description,
+        c.status,
+        c.current_version_id,
+        c.created_at,
+        c.updated_at,
+        c.published_at,
+        CASE
+          WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
+            THEN COALESCE(
+              NULLIF(LTRIM(RTRIM(CONVERT(varchar(50), c.publication_status))), ''),
+              CONVERT(varchar(50), c.status)
+            )
+          ELSE CONVERT(varchar(50), c.status)
+        END AS publication_status_effective,
+        CASE
+          WHEN COL_LENGTH('dbo.identity_chapter', 'published_version_number') IS NOT NULL
+            THEN c.published_version_number
+          ELSE NULL
+        END AS published_version_number
+      FROM dbo.identity_chapter c
+      WHERE c.chapter_id = @chapter_id
+        AND c.author_id = @author_id
+        AND ISNULL(c.is_deleted, 0) = 0;
+    `);
+
+  const row = result?.recordset?.[0] || null;
+  if (!row) return null;
+
+  const currentVersionResult = await pool
+    .request()
+    .input("chapter_id", sql.Int, chapterId)
+    .query(`
+      SELECT TOP 1
+        chapter_version_id,
+        chapter_id,
+        author_id,
+        title_snapshot,
+        body,
+        created_at
+      FROM dbo.identity_chapter_versions
+      WHERE chapter_id = @chapter_id
+      ORDER BY created_at DESC, chapter_version_id DESC;
+    `);
+
+  const currentVersion = currentVersionResult?.recordset?.[0] || null;
+
+  return {
+    chapter: row,
+    currentVersion,
+  };
+}
+
+function buildChapterPublicationPendingRequirements(detail) {
+  const out = [];
+  const chapter = detail?.chapter || null;
+  const version = detail?.currentVersion || null;
+
+  const title = String(chapter?.title ?? "").trim();
+  const body = String(version?.body ?? "").trim();
+
+  if (!title) out.push("MISSING_TITLE");
+  if (!body) out.push("MISSING_CONTENT");
+
+  const chapterVersionId = Number(version?.chapter_version_id ?? chapter?.current_version_id ?? 0);
+  if (!Number.isInteger(chapterVersionId) || chapterVersionId <= 0) {
+    out.push("INVALID_VERSION");
+  }
+
+  return out;
+}
+
+function buildChapterPublicationSnapshot(detail) {
+  const chapter = detail?.chapter || null;
+  const version = detail?.currentVersion || null;
+  const publicationStatus = normalizePublicationStatus(
+    chapter?.publication_status_effective ?? chapter?.status
+  );
+  const pending = buildChapterPublicationPendingRequirements(detail);
+
+  return {
+    chapter_id: Number(chapter?.chapter_id ?? 0),
+    status: publicationStatus,
+    persisted_status: publicationStatus,
+    is_publishable: pending.length === 0,
+    pending_requirements: pending,
+    published_at: publicationStatus === "PUBLIC" ? chapter?.published_at ?? null : null,
+    published_version_number:
+      publicationStatus === "PUBLIC"
+        ? Number(chapter?.published_version_number ?? version?.chapter_version_id ?? 0) || null
+        : null,
+    current_version_id: Number(version?.chapter_version_id ?? chapter?.current_version_id ?? 0) || null,
+  };
+}
+
 router.get("/", authRequired, async (req, res, next) => {
   try {
     const authorId = ensureAuthorId(req, res);
     if (!authorId) return;
 
     const pool = await getPool();
-    const result = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .execute("dbo.p_Chapter_List_ByAuthor");
+    const rows = await listExistingChapters(pool, authorId);
 
-    const rows = result?.recordset || [];
-    return res.json({ items: rows.map(normalizeChapterRow) });
+    return res.json({ items: rows });
   } catch (err) {
     return next(err);
   }
@@ -500,16 +629,14 @@ router.post("/", authRequired, async (req, res, next) => {
     const description =
       req.body?.description != null ? String(req.body.description).trim() : null;
     const body = req.body?.body != null ? String(req.body.body) : "";
-    const status =
+    const requestedStatus =
       req.body?.status != null ? String(req.body.status).toUpperCase() : "DRAFT";
 
     if (!title) {
       return res.status(400).json({ error: "title é obrigatório." });
     }
 
-    const safeStatus = ["DRAFT", "PUBLIC", "SHARED"].includes(status)
-      ? status
-      : "DRAFT";
+    const safeStatus = requestedStatus === "PUBLIC" ? "PUBLIC" : "DRAFT";
 
     const pool = await getPool();
     const result = await pool
@@ -555,6 +682,7 @@ router.post("/", authRequired, async (req, res, next) => {
       chapter_version_id:
         out.chapter_version_id ?? firstRow?.chapter_version_id ?? null,
       status: safeStatus,
+      publication_status: safeStatus,
     });
   } catch (err) {
     return next(err);
@@ -572,26 +700,60 @@ router.get("/:id", authRequired, async (req, res, next) => {
     }
 
     const pool = await getPool();
-    const result = await pool
-      .request()
-      .input("author_id", sql.Int, authorId)
-      .input("chapter_id", sql.Int, chapterId)
-      .execute("dbo.p_Chapter_Get_ById");
+    const detail = await getChapterEditorialState(pool, authorId, chapterId);
 
-    const recordsets = result?.recordsets || [];
-    const chapterRows = recordsets[0] || [];
-    const versionRows = recordsets[1] || [];
-
-    if (!chapterRows.length) {
+    if (!detail?.chapter) {
       return res.status(404).json({ error: "Capítulo não encontrado." });
     }
 
+    const chapter = normalizeChapterRow(detail.chapter);
+    const currentVersion = detail.currentVersion
+      ? normalizeChapterVersionRow(detail.currentVersion)
+      : null;
+
+    const resolvedStatus = chapter?.status === "PUBLIC" ? "PUBLIC" : "DRAFT";
+
     return res.json({
-      chapter: normalizeChapterRow(chapterRows[0]),
-      current_version: versionRows.length
-        ? normalizeChapterVersionRow(versionRows[0])
-        : null,
+      chapter_id: chapter.chapter_id,
+      author_id: chapter.author_id,
+      title: chapter.title,
+      description: chapter.description ?? null,
+      status: resolvedStatus,
+      publication_status: resolvedStatus,
+      current_version_id: chapter.current_version_id ?? null,
+      created_at: chapter.created_at ?? null,
+      updated_at: chapter.updated_at ?? null,
+      published_at: chapter.published_at ?? null,
+      published_version_number: chapter.published_version_number ?? null,
+      body: currentVersion?.body ?? "",
+      chapter,
+      current_version: currentVersion,
     });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get("/:id/publication", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+    const detail = await getChapterEditorialState(pool, authorId, chapterId);
+
+    if (!detail?.chapter) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    const publication = buildChapterPublicationSnapshot(detail);
+
+    return res.json(publication);
   } catch (err) {
     return next(err);
   }
@@ -654,14 +816,68 @@ router.post("/:id/publish", authRequired, async (req, res, next) => {
     }
 
     const pool = await getPool();
-    const result = await pool
+    const detailBefore = await getChapterEditorialState(pool, authorId, chapterId);
+
+    if (!detailBefore?.chapter) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    const publicationBefore = buildChapterPublicationSnapshot(detailBefore);
+    if (publicationBefore.status === "PUBLIC") {
+      return res.status(409).json({
+        error: "Capítulo já publicado.",
+        code: "CHAPTER_ALREADY_PUBLISHED",
+      });
+    }
+
+    if (!publicationBefore.is_publishable) {
+      return res.status(422).json({
+        error: "Capítulo não publicável.",
+        code: "CHAPTER_NOT_PUBLISHABLE",
+        pending_requirements: publicationBefore.pending_requirements,
+      });
+    }
+
+    await pool
       .request()
       .input("author_id", sql.Int, authorId)
       .input("chapter_id", sql.Int, chapterId)
       .execute("dbo.p_Chapter_Publish");
 
-    const row = result?.recordset?.[0] || null;
-    return res.json({ chapter_id: chapterId, status: row?.status || "PUBLIC" });
+    const detailAfter = await getChapterEditorialState(pool, authorId, chapterId);
+    const publicationAfter = buildChapterPublicationSnapshot(detailAfter);
+
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "chapter_published",
+        chapterId,
+        eventKey: buildEventKey("chapter_published", [
+          "author",
+          authorId,
+          "chapter",
+          chapterId,
+          "version",
+          publicationAfter.published_version_number ?? publicationAfter.current_version_id ?? "na",
+        ]),
+        metadata: {
+          publication_status: "PUBLIC",
+          published_version_number: publicationAfter.published_version_number ?? null,
+          source: "chapters.publish",
+        },
+      });
+    } catch (e) {
+      console.warn("NarrativeEvent chapter_published failed:", e?.message);
+    }
+
+    return res.json({
+      ok: true,
+      chapter_id: chapterId,
+      status: "PUBLIC",
+      publication_status: "PUBLIC",
+      published_at: publicationAfter.published_at,
+      published_version_number: publicationAfter.published_version_number,
+    });
   } catch (err) {
     const msg = String(err?.message || "");
     if (msg.includes("não encontrado") || msg.includes("acesso negado")) {
@@ -682,14 +898,54 @@ router.post("/:id/unpublish", authRequired, async (req, res, next) => {
     }
 
     const pool = await getPool();
-    const result = await pool
+    const detailBefore = await getChapterEditorialState(pool, authorId, chapterId);
+
+    if (!detailBefore?.chapter) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    const publicationBefore = buildChapterPublicationSnapshot(detailBefore);
+    if (publicationBefore.status !== "PUBLIC") {
+      return res.status(409).json({
+        error: "Capítulo já está em rascunho.",
+        code: "CHAPTER_ALREADY_DRAFT",
+      });
+    }
+
+    await pool
       .request()
       .input("author_id", sql.Int, authorId)
       .input("chapter_id", sql.Int, chapterId)
       .execute("dbo.p_Chapter_Unpublish");
 
-    const row = result?.recordset?.[0] || null;
-    return res.json({ chapter_id: chapterId, status: row?.status || "DRAFT" });
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "chapter_unpublished",
+        chapterId,
+        eventKey: buildEventKey("chapter_unpublished", [
+          "author",
+          authorId,
+          "chapter",
+          chapterId,
+        ]),
+        metadata: {
+          publication_status: "DRAFT",
+          source: "chapters.unpublish",
+        },
+      });
+    } catch (e) {
+      console.warn("NarrativeEvent chapter_unpublished failed:", e?.message);
+    }
+
+    return res.json({
+      ok: true,
+      chapter_id: chapterId,
+      status: "DRAFT",
+      publication_status: "DRAFT",
+      published_at: null,
+      published_version_number: null,
+    });
   } catch (err) {
     const msg = String(err?.message || "");
     if (msg.includes("não encontrado") || msg.includes("acesso negado")) {
@@ -1591,11 +1847,7 @@ router.delete("/:id/memories/:memoryId", authRequired, async (req, res, next) =>
             AND memory_id=@memory_id;
         `);
 
-      if (wasPrimary) {
-        await ensureMemoryPrimaryLink(tx, authorId, memoryId);
-      } else {
-        await ensureMemoryPrimaryLink(tx, authorId, memoryId);
-      }
+      await ensureMemoryPrimaryLink(tx, authorId, memoryId);
 
       await tx.commit();
 
