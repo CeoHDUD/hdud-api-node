@@ -1,17 +1,33 @@
+﻿# CORE
 node_modules/
 dist/
 coverage/
 *.log
-.DS_Store
 
-# env
+# ENV
 .env
 .env.*
 !.env.example
 
-# local artifacts
-freeze/
+# OS
+.DS_Store
+Thumbs.db
+
+# BUILD / CACHE
 .vite/
 .pnpm-store/
 .cache/
-Thumbs.db
+
+# FREEZER
+freeze/
+
+# HDUD STORAGE (CRÍTICO)
+public/memory-media/
+public/memories/
+public/uploads/
+tmp/
+temp/
+
+# OPTIONAL
+*.sqlite
+*.db
