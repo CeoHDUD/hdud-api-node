@@ -28,7 +28,13 @@ function normalizeRelationshipType(value) {
 
 function normalizeOriginScope(value) {
   const s = String(value ?? "").trim().toLowerCase();
-  if (s === "connection" || s === "following" || s === "network_activity" || s === "author_profile" || s === "self") {
+  if (
+    s === "connection" ||
+    s === "following" ||
+    s === "network_activity" ||
+    s === "author_profile" ||
+    s === "self"
+  ) {
     return s;
   }
   return "following";
@@ -73,11 +79,9 @@ function getApiBaseMeta(profileRow, authorId) {
 }
 
 function wantsAuthorFeed(req) {
-  const version = String(req.query?.v ?? "").trim().toLowerCase();
   const scope = String(req.query?.scope ?? req.query?.mode ?? "").trim().toLowerCase();
 
   return (
-    version === "0.1" ||
     scope === "author" ||
     scope === "profile" ||
     scope === "self" ||
@@ -155,7 +159,11 @@ async function listCommentsForTarget(pool, targetType, targetId, limit = 6) {
         c.author_id,
         c.content,
         c.created_at,
-        a.name_public AS author_name,
+        COALESCE(
+          NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+          NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+          'Autor'
+        ) AS author_name,
         a.author_code
       FROM dbo.identity_feed_comment c
       INNER JOIN dbo.identity_author a
@@ -201,6 +209,8 @@ function buildItemsFromRows(rows, commentMap) {
           event_type: normalizeEventType(row.social_event_type),
           actor_author_id: toNumberOrNull(row.social_actor_author_id),
           actor_name: row.social_actor_name ?? null,
+          comment: row.share_comment ?? null,
+          share_type: row.share_type ?? null,
         }
       : null;
 
@@ -353,6 +363,7 @@ async function queryDashboardFeed(pool, authorId, limit) {
           ) AS relationship_score
         FROM dbo.identity_follow f
         WHERE f.follower_id = @viewer_author_id
+          AND f.followed_id <> @viewer_author_id
       ),
       dedup_connections AS (
         SELECT
@@ -378,10 +389,15 @@ async function queryDashboardFeed(pool, authorId, limit) {
           dc.origin_scope,
           dc.relationship_score,
           ia.author_code,
-          ia.name_public AS author_name
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+            'Autor'
+          ) AS author_name
         FROM dedup_connections dc
         INNER JOIN dbo.identity_author ia
           ON ia.author_id = dc.author_id
+        WHERE dc.author_id <> @viewer_author_id
       ),
       direct_memory_feed AS (
         SELECT
@@ -406,6 +422,8 @@ async function queryDashboardFeed(pool, authorId, limit) {
           CAST(NULL AS varchar(30)) AS social_event_type,
           CAST(NULL AS int) AS social_actor_author_id,
           CAST(NULL AS nvarchar(120)) AS social_actor_name,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type,
           CAST(
             na.relationship_score + 120 + CASE WHEN m.published_at IS NOT NULL THEN 50 ELSE 0 END
             AS int
@@ -432,7 +450,7 @@ async function queryDashboardFeed(pool, authorId, limit) {
           na.relationship_score,
           c.title AS title,
           c.published_at AS activity_at,
-          '/chapters' AS nav,
+          CONCAT('/chapters/', CAST(c.chapter_id AS varchar(50))) AS nav,
           COALESCE(c.description, c.title, '') AS preview_text,
           CAST(NULL AS varchar(50)) AS phase_code,
           CAST(NULL AS varchar(500)) AS photo_url,
@@ -450,6 +468,8 @@ async function queryDashboardFeed(pool, authorId, limit) {
           CAST(NULL AS varchar(30)) AS social_event_type,
           CAST(NULL AS int) AS social_actor_author_id,
           CAST(NULL AS nvarchar(120)) AS social_actor_name,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type,
           CAST(
             na.relationship_score + 220 + CASE WHEN c.published_at IS NOT NULL THEN 50 ELSE 0 END
             AS int
@@ -478,6 +498,7 @@ async function queryDashboardFeed(pool, authorId, limit) {
         UNION ALL
         SELECT * FROM direct_chapter_feed
       ),
+
       social_event_candidates AS (
         SELECT
           r.reaction_id AS event_id,
@@ -490,7 +511,9 @@ async function queryDashboardFeed(pool, authorId, limit) {
           r.target_type,
           r.target_id,
           CAST('LIKE' AS varchar(30)) AS event_type,
-          r.created_at
+          r.created_at,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type
         FROM dbo.identity_feed_reaction r
         INNER JOIN network_authors na
           ON na.author_id = r.author_id
@@ -509,7 +532,9 @@ async function queryDashboardFeed(pool, authorId, limit) {
           c.target_type,
           c.target_id,
           CAST('COMMENT' AS varchar(30)) AS event_type,
-          c.created_at
+          c.created_at,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type
         FROM dbo.identity_feed_comment c
         INNER JOIN network_authors na
           ON na.author_id = c.author_id
@@ -529,18 +554,25 @@ async function queryDashboardFeed(pool, authorId, limit) {
           s.target_type,
           s.target_id,
           CAST('SHARE' AS varchar(30)) AS event_type,
-          s.created_at
+          s.created_at,
+          s.comment AS share_comment,
+          s.share_type
         FROM dbo.identity_feed_share s
         INNER JOIN network_authors na
           ON na.author_id = s.author_id
         WHERE s.author_id <> @viewer_author_id
       ),
+
       social_memory_feed AS (
         SELECT
           CAST('memory' AS varchar(20)) AS item_type,
           CAST(m.memory_id AS varchar(50)) AS source_id,
           m.author_id,
-          a.name_public AS author_name,
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+            'Autor'
+          ) AS author_name,
           a.author_code,
           sec.relationship_type,
           sec.origin_scope,
@@ -558,8 +590,15 @@ async function queryDashboardFeed(pool, authorId, limit) {
           sec.event_type AS social_event_type,
           sec.actor_author_id AS social_actor_author_id,
           sec.actor_name AS social_actor_name,
+          sec.share_comment,
+          sec.share_type,
           CAST(
-            sec.relationship_score + 300 + CASE WHEN sec.event_type = 'COMMENT' THEN 60 WHEN sec.event_type = 'SHARE' THEN 80 ELSE 40 END
+            sec.relationship_score + 300 +
+            CASE
+              WHEN sec.event_type = 'COMMENT' THEN 60
+              WHEN sec.event_type = 'SHARE' THEN 80
+              ELSE 40
+            END
             AS int
           ) AS relevance_score
         FROM social_event_candidates sec
@@ -579,19 +618,24 @@ async function queryDashboardFeed(pool, authorId, limit) {
           AND m.author_id <> sec.actor_author_id
           AND dc.author_id IS NULL
       ),
+
       social_chapter_feed AS (
         SELECT
           CAST('chapter' AS varchar(20)) AS item_type,
           CAST(c.chapter_id AS varchar(50)) AS source_id,
           c.author_id,
-          a.name_public AS author_name,
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+            'Autor'
+          ) AS author_name,
           a.author_code,
           sec.relationship_type,
           sec.origin_scope,
           sec.relationship_score,
           c.title AS title,
           sec.created_at AS activity_at,
-          '/chapters' AS nav,
+          CONCAT('/chapters/', CAST(c.chapter_id AS varchar(50))) AS nav,
           COALESCE(c.description, c.title, '') AS preview_text,
           CAST(NULL AS varchar(50)) AS phase_code,
           CAST(NULL AS varchar(500)) AS photo_url,
@@ -609,8 +653,15 @@ async function queryDashboardFeed(pool, authorId, limit) {
           sec.event_type AS social_event_type,
           sec.actor_author_id AS social_actor_author_id,
           sec.actor_name AS social_actor_name,
+          sec.share_comment,
+          sec.share_type,
           CAST(
-            sec.relationship_score + 340 + CASE WHEN sec.event_type = 'COMMENT' THEN 60 WHEN sec.event_type = 'SHARE' THEN 80 ELSE 40 END
+            sec.relationship_score + 340 +
+            CASE
+              WHEN sec.event_type = 'COMMENT' THEN 60
+              WHEN sec.event_type = 'SHARE' THEN 80
+              ELSE 40
+            END
             AS int
           ) AS relevance_score
         FROM social_event_candidates sec
@@ -656,6 +707,7 @@ async function queryDashboardFeed(pool, authorId, limit) {
         ) x
         WHERE x.rn = 1
       ),
+
       unified AS (
         SELECT * FROM direct_feed
         UNION ALL
@@ -681,9 +733,25 @@ async function queryDashboardFeed(pool, authorId, limit) {
           social_event_type,
           social_actor_author_id,
           social_actor_name,
+          share_comment,
+          share_type,
           relevance_score
         FROM social_feed_ranked
+      ),
+
+      ranked AS (
+        SELECT
+          u.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY u.item_type, u.source_id
+            ORDER BY
+              u.activity_at DESC,
+              u.published_at DESC,
+              u.source_id DESC
+          ) AS rn
+        FROM unified u
       )
+
       SELECT TOP (@limit)
         u.item_type,
         u.source_id,
@@ -707,11 +775,13 @@ async function queryDashboardFeed(pool, authorId, limit) {
         u.social_event_type,
         u.social_actor_author_id,
         u.social_actor_name,
+        u.share_comment,
+        u.share_type,
         reactions.total_reactions,
         comments.total_comments,
         shares.total_shares,
         CASE WHEN my_like.reaction_id IS NULL THEN CAST(0 AS bit) ELSE CAST(1 AS bit) END AS liked_by_me
-      FROM unified u
+      FROM ranked u
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_reactions
         FROM dbo.identity_feed_reaction r
@@ -738,11 +808,12 @@ async function queryDashboardFeed(pool, authorId, limit) {
           AND r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
           AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
       ) my_like
+      WHERE u.rn = 1
       ORDER BY
-        u.relevance_score DESC,
-        u.activity_at DESC,
-        u.source_id DESC;
-    `);
+		  COALESCE(u.activity_at, u.published_at) DESC,
+		  u.relevance_score DESC,
+		  u.source_id DESC;
+			`);
 
   return result.recordset || [];
 }
@@ -758,7 +829,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           CAST('memory' AS varchar(20)) AS item_type,
           CAST(m.memory_id AS varchar(50)) AS source_id,
           m.author_id,
-          a.name_public AS author_name,
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+            'Autor'
+          ) AS author_name,
           a.author_code,
           CAST('self' AS varchar(20)) AS relationship_type,
           CAST('author_profile' AS varchar(30)) AS origin_scope,
@@ -776,6 +851,8 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           last_social.event_type AS social_event_type,
           last_social.actor_author_id AS social_actor_author_id,
           last_social.actor_name AS social_actor_name,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type,
           CAST(
             1000
             + CASE WHEN m.published_at IS NOT NULL THEN 120 ELSE 0 END
@@ -802,7 +879,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
             SELECT
               CAST('LIKE' AS varchar(30)) AS event_type,
               r.author_id AS actor_author_id,
-              ia.name_public AS actor_name,
+              COALESCE(
+                NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+                NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+                'Autor'
+              ) AS actor_name,
               r.created_at
             FROM dbo.identity_feed_reaction r
             INNER JOIN dbo.identity_author ia
@@ -816,7 +897,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
             SELECT
               CAST('COMMENT' AS varchar(30)) AS event_type,
               c.author_id AS actor_author_id,
-              ia.name_public AS actor_name,
+              COALESCE(
+                NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+                NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+                'Autor'
+              ) AS actor_name,
               c.created_at
             FROM dbo.identity_feed_comment c
             INNER JOIN dbo.identity_author ia
@@ -831,7 +916,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
             SELECT
               CAST('SHARE' AS varchar(30)) AS event_type,
               s.author_id AS actor_author_id,
-              ia.name_public AS actor_name,
+              COALESCE(
+                NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+                NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+                'Autor'
+              ) AS actor_name,
               s.created_at
             FROM dbo.identity_feed_share s
             INNER JOIN dbo.identity_author ia
@@ -847,19 +936,24 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           AND UPPER(LTRIM(RTRIM(ISNULL(CONVERT(varchar(50), m.publication_status), '')))) = 'PUBLISHED'
           AND m.published_at IS NOT NULL
       ),
+
       self_chapter_feed AS (
         SELECT
           CAST('chapter' AS varchar(20)) AS item_type,
           CAST(c.chapter_id AS varchar(50)) AS source_id,
           c.author_id,
-          a.name_public AS author_name,
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+            'Autor'
+          ) AS author_name,
           a.author_code,
           CAST('self' AS varchar(20)) AS relationship_type,
           CAST('author_profile' AS varchar(30)) AS origin_scope,
           CAST(1000 AS int) AS relationship_score,
           c.title AS title,
           COALESCE(last_social.created_at, c.published_at) AS activity_at,
-          '/chapters' AS nav,
+          CONCAT('/chapters/', CAST(c.chapter_id AS varchar(50))) AS nav,
           COALESCE(c.description, c.title, '') AS preview_text,
           CAST(NULL AS varchar(50)) AS phase_code,
           CAST(NULL AS varchar(500)) AS photo_url,
@@ -877,6 +971,8 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           last_social.event_type AS social_event_type,
           last_social.actor_author_id AS social_actor_author_id,
           last_social.actor_name AS social_actor_name,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type,
           CAST(
             1000
             + CASE WHEN c.published_at IS NOT NULL THEN 160 ELSE 0 END
@@ -901,7 +997,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
             SELECT
               CAST('LIKE' AS varchar(30)) AS event_type,
               r.author_id AS actor_author_id,
-              ia.name_public AS actor_name,
+              COALESCE(
+                NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+                NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+                'Autor'
+              ) AS actor_name,
               r.created_at
             FROM dbo.identity_feed_reaction r
             INNER JOIN dbo.identity_author ia
@@ -915,7 +1015,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
             SELECT
               CAST('COMMENT' AS varchar(30)) AS event_type,
               cm.author_id AS actor_author_id,
-              ia.name_public AS actor_name,
+              COALESCE(
+                NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+                NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+                'Autor'
+              ) AS actor_name,
               cm.created_at
             FROM dbo.identity_feed_comment cm
             INNER JOIN dbo.identity_author ia
@@ -930,7 +1034,11 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
             SELECT
               CAST('SHARE' AS varchar(30)) AS event_type,
               s.author_id AS actor_author_id,
-              ia.name_public AS actor_name,
+              COALESCE(
+                NULLIF(LTRIM(RTRIM(ia.name_public)), ''),
+                NULLIF(LTRIM(RTRIM(ia.author_code)), ''),
+                'Autor'
+              ) AS actor_name,
               s.created_at
             FROM dbo.identity_feed_share s
             INNER JOIN dbo.identity_author ia
@@ -962,6 +1070,7 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
         UNION ALL
         SELECT * FROM self_chapter_feed
       )
+
       SELECT TOP (@limit)
         u.item_type,
         u.source_id,
@@ -985,6 +1094,8 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
         u.social_event_type,
         u.social_actor_author_id,
         u.social_actor_name,
+        u.share_comment,
+        u.share_type,
         reactions.total_reactions,
         comments.total_comments,
         shares.total_shares,
@@ -1025,11 +1136,6 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
   return result.recordset || [];
 }
 
-// ==========================================================
-// GET /feed
-// - default: dashboard social
-// - v=0.1 | scope=author/profile/self: feed do autor
-// ==========================================================
 router.get("/", authenticate, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
@@ -1051,7 +1157,11 @@ router.get("/", authenticate, async (req, res) => {
         SELECT TOP 1
           a.author_id,
           a.author_code,
-          a.name_public AS display_name
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+            'Autor'
+          ) AS display_name
         FROM dbo.identity_author a
         WHERE a.author_id = @author_id;
       `);
@@ -1083,8 +1193,10 @@ router.get("/", authenticate, async (req, res) => {
         generated_at: new Date().toISOString(),
         limit,
         truth_mode: "published_only",
-        scope_mode: authorFeedMode ? "author_profile_with_social_context" : "network_only_with_social_activity",
-        ordering_mode: authorFeedMode ? "activity_then_relevance" : "relevance_then_activity",
+        scope_mode: authorFeedMode
+          ? "author_profile_with_social_context"
+          : "dashboard_network_with_social_activity",
+        ordering_mode: "activity_first",
         item_count: items.length,
         chapter_count: chapterCount,
         memory_count: memoryCount,
@@ -1102,68 +1214,34 @@ router.get("/", authenticate, async (req, res) => {
   }
 });
 
-router.get("/:targetType/:targetId/comments", authenticate, async (req, res) => {
-  try {
-    const authorId = getAuthorId(req);
-    if (!authorId) {
-      return res.status(401).json({ ok: false, error: "Não autenticado." });
-    }
-
-    const targetType = normalizeTargetType(req.params.targetType);
-    const targetId = Number(req.params.targetId);
-    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
-
-    if (!targetType || !Number.isInteger(targetId) || targetId <= 0) {
-      return res.status(400).json({ ok: false, error: "Alvo inválido." });
-    }
-
-    const pool = await getPool();
-    const comments = await listCommentsForTarget(pool, targetType, targetId, limit);
-
-    return res.json({
-      ok: true,
-      target_type: targetType,
-      target_id: targetId,
-      items: comments,
-      meta: {
-        generated_at: new Date().toISOString(),
-        count: comments.length,
-      },
-    });
-  } catch (err) {
-    console.error("[feed.comments]", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Erro ao carregar comentários.",
-      detail: err?.message || "Falha inesperada.",
-    });
-  }
-});
-
 router.post("/like", authenticate, async (req, res) => {
   try {
     const authorId = getAuthorId(req);
+
     if (!authorId) {
-      return res.status(401).json({ ok: false, error: "Não autenticado." });
+      return res.status(401).json({
+        ok: false,
+        error: "Não autenticado.",
+      });
     }
 
     const targetType = normalizeTargetType(req.body?.target_type);
-    const targetId = Number(req.body?.target_id);
+    const targetId = toNumberOrNull(req.body?.target_id);
 
-    if (!targetType || !Number.isInteger(targetId) || targetId <= 0) {
-      return res.status(400).json({ ok: false, error: "Alvo inválido para curtir." });
+    if (!targetType || !targetId) {
+      return res.status(400).json({
+        ok: false,
+        error: "target_type e target_id são obrigatórios.",
+      });
     }
 
     const pool = await getPool();
-    const checked = await ensureTargetPublished(pool, targetType, targetId);
-    if (!checked.ok) {
-      return res.status(checked.status).json({ ok: false, error: checked.error });
-    }
+    const published = await ensureTargetPublished(pool, targetType, targetId);
 
-    if (Number(checked.target.author_id) === authorId) {
-      return res.status(400).json({
+    if (!published.ok) {
+      return res.status(published.status).json({
         ok: false,
-        error: "Você não pode curtir seu próprio conteúdo.",
+        error: published.error,
       });
     }
 
@@ -1182,10 +1260,10 @@ router.post("/like", authenticate, async (req, res) => {
 
     let liked = false;
 
-    if (existing.recordset?.[0]?.reaction_id) {
+    if (existing.recordset?.length) {
       await pool
         .request()
-        .input("reaction_id", sql.BigInt, Number(existing.recordset[0].reaction_id))
+        .input("reaction_id", sql.Int, existing.recordset[0].reaction_id)
         .query(`
           DELETE FROM dbo.identity_feed_reaction
           WHERE reaction_id = @reaction_id;
@@ -1199,50 +1277,27 @@ router.post("/like", authenticate, async (req, res) => {
         .input("target_type", sql.VarChar(20), targetType)
         .input("target_id", sql.Int, targetId)
         .query(`
-          INSERT INTO dbo.identity_feed_reaction (
-            author_id,
-            target_type,
-            target_id,
-            reaction_type,
-            created_at
-          )
-          VALUES (
-            @author_id,
-            @target_type,
-            @target_id,
-            'LIKE',
-            SYSUTCDATETIME()
-          );
+          INSERT INTO dbo.identity_feed_reaction
+            (author_id, target_type, target_id, reaction_type, created_at)
+          VALUES
+            (@author_id, @target_type, @target_id, 'LIKE', SYSUTCDATETIME());
         `);
 
       liked = true;
     }
 
-    const countResult = await pool
-      .request()
-      .input("target_type", sql.VarChar(20), targetType)
-      .input("target_id", sql.Int, targetId)
-      .query(`
-        SELECT COUNT_BIG(1) AS total_likes
-        FROM dbo.identity_feed_reaction
-        WHERE target_type = @target_type
-          AND target_id = @target_id;
-      `);
+    const counts = await getInteractionCounts(pool, targetType, targetId);
 
     return res.json({
       ok: true,
       liked,
-      target_type: targetType,
-      target_id: targetId,
-      counts: {
-        likes: Number(countResult.recordset?.[0]?.total_likes || 0),
-      },
+      counts,
     });
   } catch (err) {
     console.error("[feed.like]", err);
     return res.status(500).json({
       ok: false,
-      error: "Erro ao registrar curtida.",
+      error: "Erro ao curtir publicação.",
       detail: err?.message || "Falha inesperada.",
     });
   }
@@ -1251,87 +1306,75 @@ router.post("/like", authenticate, async (req, res) => {
 router.post("/comment", authenticate, async (req, res) => {
   try {
     const authorId = getAuthorId(req);
+
     if (!authorId) {
-      return res.status(401).json({ ok: false, error: "Não autenticado." });
+      return res.status(401).json({
+        ok: false,
+        error: "Não autenticado.",
+      });
     }
 
     const targetType = normalizeTargetType(req.body?.target_type);
-    const targetId = Number(req.body?.target_id);
-    const content = String(req.body?.content ?? "").trim();
+    const targetId = toNumberOrNull(req.body?.target_id);
+    const content = String(req.body?.content || "").trim();
 
-    if (!targetType || !Number.isInteger(targetId) || targetId <= 0) {
-      return res.status(400).json({ ok: false, error: "Alvo inválido para comentário." });
+    if (!targetType || !targetId) {
+      return res.status(400).json({
+        ok: false,
+        error: "target_type e target_id são obrigatórios.",
+      });
     }
 
     if (!content) {
-      return res.status(400).json({ ok: false, error: "Comentário vazio." });
+      return res.status(400).json({
+        ok: false,
+        error: "Comentário vazio.",
+      });
     }
 
-    if (content.length > 4000) {
-      return res.status(400).json({ ok: false, error: "Comentário excede o limite de 4000 caracteres." });
+    if (content.length > 1200) {
+      return res.status(400).json({
+        ok: false,
+        error: "Comentário excede 1200 caracteres.",
+      });
     }
 
     const pool = await getPool();
-    const checked = await ensureTargetPublished(pool, targetType, targetId);
-    if (!checked.ok) {
-      return res.status(checked.status).json({ ok: false, error: checked.error });
+    const published = await ensureTargetPublished(pool, targetType, targetId);
+
+    if (!published.ok) {
+      return res.status(published.status).json({
+        ok: false,
+        error: published.error,
+      });
     }
 
-    const insertResult = await pool
+    await pool
       .request()
       .input("author_id", sql.Int, authorId)
       .input("target_type", sql.VarChar(20), targetType)
       .input("target_id", sql.Int, targetId)
       .input("content", sql.NVarChar(sql.MAX), content)
       .query(`
-        INSERT INTO dbo.identity_feed_comment (
-          author_id,
-          target_type,
-          target_id,
-          content,
-          created_at,
-          is_deleted
-        )
-        OUTPUT INSERTED.comment_id
-        VALUES (
-          @author_id,
-          @target_type,
-          @target_id,
-          @content,
-          SYSUTCDATETIME(),
-          0
-        );
+        INSERT INTO dbo.identity_feed_comment
+          (author_id, target_type, target_id, content, created_at, is_deleted)
+        VALUES
+          (@author_id, @target_type, @target_id, @content, SYSUTCDATETIME(), 0);
       `);
 
-    const comments = await listCommentsForTarget(pool, targetType, targetId, 3);
-
-    const countResult = await pool
-      .request()
-      .input("target_type", sql.VarChar(20), targetType)
-      .input("target_id", sql.Int, targetId)
-      .query(`
-        SELECT COUNT_BIG(1) AS total_comments
-        FROM dbo.identity_feed_comment
-        WHERE target_type = @target_type
-          AND target_id = @target_id
-          AND ISNULL(is_deleted, 0) = 0;
-      `);
+    const counts = await getInteractionCounts(pool, targetType, targetId);
+    const commentsPreview = await listCommentsForTarget(pool, targetType, targetId, 3);
 
     return res.json({
       ok: true,
-      comment_id: Number(insertResult.recordset?.[0]?.comment_id || 0),
-      target_type: targetType,
-      target_id: targetId,
-      counts: {
-        comments: Number(countResult.recordset?.[0]?.total_comments || 0),
-      },
-      comments_preview: comments,
+      counts,
+      comments_preview: commentsPreview,
     });
   } catch (err) {
     console.error("[feed.comment]", err);
     return res.status(500).json({
       ok: false,
-      error: "Erro ao registrar comentário.",
+      error: "Erro ao comentar publicação.",
       detail: err?.message || "Falha inesperada.",
     });
   }
@@ -1340,21 +1383,49 @@ router.post("/comment", authenticate, async (req, res) => {
 router.post("/share", authenticate, async (req, res) => {
   try {
     const authorId = getAuthorId(req);
+
     if (!authorId) {
-      return res.status(401).json({ ok: false, error: "Não autenticado." });
+      return res.status(401).json({
+        ok: false,
+        error: "Não autenticado.",
+      });
     }
 
     const targetType = normalizeTargetType(req.body?.target_type);
-    const targetId = Number(req.body?.target_id);
+    const targetId = toNumberOrNull(req.body?.target_id);
+    const shareType = String(req.body?.share_type || "INTERNAL").trim().toUpperCase();
+    const comment = String(req.body?.comment || "").trim();
+    const externalUrl = String(req.body?.external_url || "").trim();
 
-    if (!targetType || !Number.isInteger(targetId) || targetId <= 0) {
-      return res.status(400).json({ ok: false, error: "Alvo inválido para compartilhamento." });
+    if (!targetType || !targetId) {
+      return res.status(400).json({
+        ok: false,
+        error: "target_type e target_id são obrigatórios.",
+      });
+    }
+
+    if (comment.length > 800) {
+      return res.status(400).json({
+        ok: false,
+        error: "Comentário do compartilhamento excede 800 caracteres.",
+      });
+    }
+
+    if (externalUrl && !/^https?:\/\//i.test(externalUrl)) {
+      return res.status(400).json({
+        ok: false,
+        error: "URL externa inválida.",
+      });
     }
 
     const pool = await getPool();
-    const checked = await ensureTargetPublished(pool, targetType, targetId);
-    if (!checked.ok) {
-      return res.status(checked.status).json({ ok: false, error: checked.error });
+    const published = await ensureTargetPublished(pool, targetType, targetId);
+
+    if (!published.ok) {
+      return res.status(published.status).json({
+        ok: false,
+        error: published.error,
+      });
     }
 
     await pool
@@ -1362,48 +1433,67 @@ router.post("/share", authenticate, async (req, res) => {
       .input("author_id", sql.Int, authorId)
       .input("target_type", sql.VarChar(20), targetType)
       .input("target_id", sql.Int, targetId)
+      .input("share_type", sql.VarChar(20), shareType === "EXTERNAL" ? "EXTERNAL" : "INTERNAL")
+      .input("comment", sql.NVarChar(sql.MAX), comment || null)
+      .input("external_url", sql.NVarChar(500), externalUrl || null)
       .query(`
-        INSERT INTO dbo.identity_feed_share (
-          author_id,
-          target_type,
-          target_id,
-          created_at
-        )
-        VALUES (
-          @author_id,
-          @target_type,
-          @target_id,
-          SYSUTCDATETIME()
-        );
+        INSERT INTO dbo.identity_feed_share
+          (author_id, target_type, target_id, share_type, comment, external_url, created_at)
+        VALUES
+          (@author_id, @target_type, @target_id, @share_type, @comment, @external_url, SYSUTCDATETIME());
       `);
 
-    const countResult = await pool
-      .request()
-      .input("target_type", sql.VarChar(20), targetType)
-      .input("target_id", sql.Int, targetId)
-      .query(`
-        SELECT COUNT_BIG(1) AS total_shares
-        FROM dbo.identity_feed_share
-        WHERE target_type = @target_type
-          AND target_id = @target_id;
-      `);
+    const counts = await getInteractionCounts(pool, targetType, targetId);
 
     return res.json({
       ok: true,
-      target_type: targetType,
-      target_id: targetId,
-      counts: {
-        shares: Number(countResult.recordset?.[0]?.total_shares || 0),
-      },
+      counts,
     });
   } catch (err) {
     console.error("[feed.share]", err);
     return res.status(500).json({
       ok: false,
-      error: "Erro ao registrar compartilhamento.",
+      error: "Erro ao compartilhar publicação.",
       detail: err?.message || "Falha inesperada.",
     });
   }
 });
+
+async function getInteractionCounts(pool, targetType, targetId) {
+  const result = await pool
+    .request()
+    .input("target_type", sql.VarChar(20), targetType)
+    .input("target_id", sql.Int, targetId)
+    .query(`
+      SELECT
+        (
+          SELECT COUNT_BIG(1)
+          FROM dbo.identity_feed_reaction r
+          WHERE r.target_type = @target_type
+            AND r.target_id = @target_id
+        ) AS likes,
+        (
+          SELECT COUNT_BIG(1)
+          FROM dbo.identity_feed_comment c
+          WHERE c.target_type = @target_type
+            AND c.target_id = @target_id
+            AND ISNULL(c.is_deleted, 0) = 0
+        ) AS comments,
+        (
+          SELECT COUNT_BIG(1)
+          FROM dbo.identity_feed_share s
+          WHERE s.target_type = @target_type
+            AND s.target_id = @target_id
+        ) AS shares;
+    `);
+
+  const row = result.recordset?.[0] || {};
+
+  return {
+    likes: Number(row.likes || 0),
+    comments: Number(row.comments || 0),
+    shares: Number(row.shares || 0),
+  };
+}
 
 export default router;

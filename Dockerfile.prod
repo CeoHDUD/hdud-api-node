@@ -1,10 +1,21 @@
-﻿FROM node:20-alpine
+﻿# C:\HDUD_DATA\hdud-api-node\Dockerfile.prod
+
+FROM node:20-alpine
+
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml* ./
-RUN corepack enable && pnpm install --frozen-lockfile --prod || pnpm install --prod
 
-COPY . .
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+RUN pnpm install --frozen-lockfile --prod || pnpm install --prod
+
+RUN apk add --no-cache \
+    ffmpeg \
+    libc6-compat
+
+COPY src ./src
+COPY public ./public
 
 EXPOSE 4000
+
 CMD ["node", "src/server.js"]

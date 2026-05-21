@@ -9,21 +9,102 @@ import { getPool, sql } from "../db.js";
 import { getRedisConnection } from "../queue/redis.js";
 import { MEMORY_IMAGE_QUEUE_NAME } from "../queue/memory-image.queue.js";
 
-const WORKER_CONCURRENCY = Number(
-  process.env.MEMORY_IMAGE_WORKER_CONCURRENCY || 2
-);
+const WORKER_CONCURRENCY = Number(process.env.MEMORY_IMAGE_WORKER_CONCURRENCY || 2);
 
 const PUBLIC_DIR = path.join(process.cwd(), "public");
 
-const FEED_WIDTH = 1200;
-const FEED_HEIGHT = 1500; // 4:5
-const THUMB_SIZE = 400;
+const FEED_WIDTH = Number(process.env.MEMORY_IMAGE_FEED_WIDTH || 1080);
+const FEED_HEIGHT = Number(process.env.MEMORY_IMAGE_FEED_HEIGHT || 1350);
+const THUMB_SIZE = Number(process.env.MEMORY_IMAGE_THUMB_SIZE || 500);
+
+const CLEAN_CANVAS_BG = Object.freeze({ r: 242, g: 242, b: 244 });
+
+const FEED_CANVAS = Object.freeze({
+  portrait: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "portrait_editorial",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_PORTRAIT_INSET || 0),
+    foregroundFit: "cover",
+    backgroundBlur: 14,
+    backgroundBrightness: 1.0,
+    backgroundSaturation: 0.96,
+    cleanCanvas: false,
+  },
+  landscape: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "landscape_contain",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_LANDSCAPE_INSET || 72),
+    foregroundFit: "contain",
+    backgroundBlur: 18,
+    backgroundBrightness: 1.03,
+    backgroundSaturation: 0.9,
+    cleanCanvas: false,
+  },
+  square: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "square_clean_canvas",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_SQUARE_INSET || 96),
+    foregroundFit: "contain",
+    backgroundBlur: 0,
+    backgroundBrightness: 1,
+    backgroundSaturation: 1,
+    cleanCanvas: true,
+  },
+  panoramic: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "panoramic_contain",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_PANORAMIC_INSET || 108),
+    foregroundFit: "contain",
+    backgroundBlur: 20,
+    backgroundBrightness: 1.04,
+    backgroundSaturation: 0.88,
+    cleanCanvas: false,
+  },
+  collage: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "collage_clean_canvas",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_COLLAGE_INSET || 36),
+    foregroundFit: "contain",
+    backgroundBlur: 0,
+    backgroundBrightness: 1,
+    backgroundSaturation: 1,
+    cleanCanvas: true,
+  },
+  logo: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "logo_clean_canvas",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_LOGO_INSET || 140),
+    foregroundFit: "contain",
+    backgroundBlur: 0,
+    backgroundBrightness: 1,
+    backgroundSaturation: 1,
+    cleanCanvas: true,
+  },
+  unknown: {
+    width: FEED_WIDTH,
+    height: FEED_HEIGHT,
+    mode: "unknown_clean_canvas",
+    inset: Number(process.env.MEMORY_IMAGE_FEED_UNKNOWN_INSET || 96),
+    foregroundFit: "contain",
+    backgroundBlur: 0,
+    backgroundBrightness: 1,
+    backgroundSaturation: 1,
+    cleanCanvas: true,
+  },
+});
 
 console.log("[WORKER][MEMORY_IMAGE] starting...", {
   queue: MEMORY_IMAGE_QUEUE_NAME,
   concurrency: WORKER_CONCURRENCY,
   publicDir: PUBLIC_DIR,
   feedVariant: `${FEED_WIDTH}x${FEED_HEIGHT}`,
+  contract: "smart-media-pipeline-v1.1-clean-canvas",
 });
 
 function toInt(v) {
@@ -37,17 +118,35 @@ function normalizeString(v) {
   return s.length ? s : null;
 }
 
-function classifyOrientation(width, height) {
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(Math.trunc(n), max));
+}
+
+function classifyGeometry(width, height) {
   const w = Number(width || 0);
   const h = Number(height || 0);
-
   if (!(w > 0) || !(h > 0)) return "unknown";
 
   const ratio = w / h;
-  if (ratio > 2) return "panoramic";
+
+  if (ratio >= 2.05) return "panoramic";
   if (ratio > 1.15) return "landscape";
-  if (ratio < 0.85) return "portrait";
+  if (ratio <= 0.9) return "portrait";
   return "square";
+}
+
+function resolveFeedCanvas(kind = "unknown") {
+  const key = String(kind || "unknown").toLowerCase();
+  const canvas = FEED_CANVAS[key] || FEED_CANVAS.unknown;
+
+  return {
+    ...canvas,
+    width: clampInt(canvas.width, 320, 3000, FEED_WIDTH),
+    height: clampInt(canvas.height, 320, 3000, FEED_HEIGHT),
+    inset: clampInt(canvas.inset, 0, 260, 96),
+  };
 }
 
 async function ensureDir(dir) {
@@ -55,13 +154,7 @@ async function ensureDir(dir) {
 }
 
 function memoryMediaFolder(authorId, memoryId, mediaId) {
-  return path.join(
-    PUBLIC_DIR,
-    "memory-media",
-    String(authorId),
-    `memory_${memoryId}`,
-    `media_${mediaId}`
-  );
+  return path.join(PUBLIC_DIR, "memory-media", String(authorId), `memory_${memoryId}`, `media_${mediaId}`);
 }
 
 function buildImagePaths(baseDir) {
@@ -73,9 +166,7 @@ function buildImagePaths(baseDir) {
 }
 
 function buildOriginalStoragePath(authorId, memoryId, mediaId) {
-  return `memory-media/${String(authorId)}/memory_${String(
-    memoryId
-  )}/media_${String(mediaId)}/original.jpg`;
+  return `memory-media/${String(authorId)}/memory_${String(memoryId)}/media_${String(mediaId)}/original.jpg`;
 }
 
 async function getColumns(pool, schemaName, tableName) {
@@ -124,7 +215,7 @@ async function updateMemoryMedia(pool, mediaId, payload) {
 
   if (columns.has("image_orientation") && payload.image_orientation !== undefined) {
     assignments.push("[image_orientation] = @image_orientation");
-    request.input("image_orientation", sql.VarChar(20), payload.image_orientation);
+    request.input("image_orientation", sql.VarChar(30), payload.image_orientation);
   }
 
   if (columns.has("processed") && payload.processed !== undefined) {
@@ -192,7 +283,7 @@ async function updateMemoryImageMeta(pool, memoryId, meta) {
 
   if (columns.has("image_orientation")) {
     assignments.push("image_orientation = @image_orientation");
-    request.input("image_orientation", sql.VarChar(20), meta.orientation);
+    request.input("image_orientation", sql.VarChar(30), meta.orientation);
   }
 
   if (!assignments.length) return;
@@ -204,39 +295,186 @@ async function updateMemoryImageMeta(pool, memoryId, meta) {
   `);
 }
 
-async function renderFeedVariant(buffer) {
-  const base = sharp(buffer, { failOn: "none" }).rotate();
+async function computeVisualScore(buffer, geometry) {
+  const stats = await sharp(buffer, { failOn: "none" })
+    .rotate()
+    .resize(96, 96, { fit: "fill", kernel: sharp.kernel.nearest })
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-  const background = await base
+  const raw = stats.data;
+  const channels = stats.info.channels || 3;
+  const width = 96;
+  const height = 96;
+  const rowEdges = [];
+  const colEdges = [];
+
+  function px(index) {
+    const base = index * channels;
+    return (raw[base] + raw[base + 1] + raw[base + 2]) / 3;
+  }
+
+  for (let y = 1; y < height; y++) {
+    let sum = 0;
+    for (let x = 0; x < width; x++) {
+      sum += Math.abs(px(y * width + x) - px((y - 1) * width + x));
+    }
+    rowEdges.push(sum / width);
+  }
+
+  for (let x = 1; x < width; x++) {
+    let sum = 0;
+    for (let y = 0; y < height; y++) {
+      sum += Math.abs(px(y * width + x) - px(y * width + x - 1));
+    }
+    colEdges.push(sum / height);
+  }
+
+  const avgRow = rowEdges.reduce((a, b) => a + b, 0) / Math.max(1, rowEdges.length);
+  const avgCol = colEdges.reduce((a, b) => a + b, 0) / Math.max(1, colEdges.length);
+
+  const hardRows = rowEdges.filter((v) => v >= Math.max(28, avgRow * 2.1)).length;
+  const hardCols = colEdges.filter((v) => v >= Math.max(28, avgCol * 2.1)).length;
+
+  const centralVerticalEdges = colEdges.filter((v, idx) => idx > 22 && idx < 73 && v >= Math.max(24, avgCol * 1.85)).length;
+  const centralHorizontalEdges = rowEdges.filter((v, idx) => idx > 22 && idx < 73 && v >= Math.max(24, avgRow * 1.85)).length;
+
+  const gridScore =
+    hardRows * 1.25 +
+    hardCols * 1.25 +
+    centralVerticalEdges * 1.6 +
+    centralHorizontalEdges * 1.6;
+
+  const imageStats = await sharp(buffer, { failOn: "none" }).rotate().stats();
+  const channelsStats = imageStats.channels || [];
+  const avgR = channelsStats[0]?.mean ?? 0;
+  const avgG = channelsStats[1]?.mean ?? 0;
+  const avgB = channelsStats[2]?.mean ?? 0;
+  const stdR = channelsStats[0]?.stdev ?? 0;
+  const stdG = channelsStats[1]?.stdev ?? 0;
+  const stdB = channelsStats[2]?.stdev ?? 0;
+
+  const avgBrightness = (avgR + avgG + avgB) / 3;
+  const avgStd = (stdR + stdG + stdB) / 3;
+
+  const collageMode =
+    gridScore >= 18 ||
+    (geometry === "square" && hardRows + hardCols >= 8) ||
+    (geometry === "landscape" && centralVerticalEdges + centralHorizontalEdges >= 8);
+
+  const logoLike =
+    !collageMode &&
+    (geometry === "square" || geometry === "portrait") &&
+    avgBrightness >= 170 &&
+    avgStd <= 92 &&
+    hardRows + hardCols <= 12;
+
+  return {
+    collageMode,
+    logoLike,
+    gridScore: Number(gridScore.toFixed(2)),
+    hardRows,
+    hardCols,
+    centralVerticalEdges,
+    centralHorizontalEdges,
+    avgBrightness: Number(avgBrightness.toFixed(2)),
+    avgStd: Number(avgStd.toFixed(2)),
+  };
+}
+
+function classifySmartMedia({ geometry, visualScore }) {
+  if (visualScore?.collageMode) return "collage";
+  if (visualScore?.logoLike) return "logo";
+  return geometry || "unknown";
+}
+
+async function renderBlurredBackground(base, canvas) {
+  return base
     .clone()
-    .resize(FEED_WIDTH, FEED_HEIGHT, {
+    .resize(canvas.width, canvas.height, {
       fit: "cover",
       position: "centre",
       withoutEnlargement: false,
+      kernel: sharp.kernel.lanczos3,
     })
-    .blur(18)
+    .blur(canvas.backgroundBlur)
     .modulate({
-      brightness: 0.96,
-      saturation: 1.04,
+      brightness: canvas.backgroundBrightness,
+      saturation: canvas.backgroundSaturation,
     })
-    .jpeg({ quality: 82, mozjpeg: true })
+    .jpeg({
+      quality: 86,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    })
     .toBuffer();
+}
 
-  const foreground = await base
+async function renderCleanCanvas(canvas) {
+  return sharp({
+    create: {
+      width: canvas.width,
+      height: canvas.height,
+      channels: 3,
+      background: CLEAN_CANVAS_BG,
+    },
+  })
+    .jpeg({
+      quality: 92,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    })
+    .toBuffer();
+}
+
+async function renderForeground(base, canvas) {
+  const maxWidth = Math.max(240, canvas.width - canvas.inset * 2);
+  const maxHeight = Math.max(240, canvas.height - canvas.inset * 2);
+
+  const fit = canvas.foregroundFit === "cover" ? "cover" : "contain";
+
+  return base
     .clone()
-    .resize(FEED_WIDTH - 72, FEED_HEIGHT - 72, {
-      fit: "contain",
+    .resize(maxWidth, maxHeight, {
+      fit,
       position: "centre",
-      withoutEnlargement: true,
+      withoutEnlargement: false,
+      kernel: sharp.kernel.lanczos3,
       background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .sharpen({
+      sigma: 0.38,
+      m1: 0.54,
+      m2: 1.06,
     })
     .png()
     .toBuffer();
+}
 
-  return sharp(background)
+async function renderFeedVariant(buffer, smartKind = "unknown") {
+  const base = sharp(buffer, { failOn: "none" }).rotate();
+  const canvas = resolveFeedCanvas(smartKind);
+
+  const foreground = await renderForeground(base, canvas);
+
+  const background = canvas.cleanCanvas
+    ? await renderCleanCanvas(canvas)
+    : await renderBlurredBackground(base, canvas);
+
+  const output = await sharp(background)
     .composite([{ input: foreground, gravity: "centre" }])
-    .jpeg({ quality: 88, mozjpeg: true })
+    .jpeg({
+      quality: 91,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    })
     .toBuffer();
+
+  return {
+    buffer: output,
+    canvas,
+  };
 }
 
 async function processJob(job) {
@@ -274,17 +512,23 @@ async function processJob(job) {
 
   const width = Number(metadata?.width || 0) || null;
   const height = Number(metadata?.height || 0) || null;
-  const aspectRatio =
-    width && height ? Number((width / height).toFixed(4)) : null;
-  const orientation = classifyOrientation(width, height);
+  const aspectRatio = width && height ? Number((width / height).toFixed(4)) : null;
+
+  const geometry = classifyGeometry(width, height);
+  const visualScore = await computeVisualScore(buffer, geometry);
+  const smartKind = classifySmartMedia({ geometry, visualScore });
 
   await source
     .clone()
-    .jpeg({ quality: 92, mozjpeg: true })
+    .jpeg({
+      quality: 96,
+      mozjpeg: true,
+      chromaSubsampling: "4:4:4",
+    })
     .toFile(paths.original);
 
-  const feedBuffer = await renderFeedVariant(buffer);
-  await fs.writeFile(paths.feed, feedBuffer);
+  const feedVariant = await renderFeedVariant(buffer, smartKind);
+  await fs.writeFile(paths.feed, feedVariant.buffer);
 
   await source
     .clone()
@@ -292,8 +536,13 @@ async function processJob(job) {
       fit: "cover",
       position: "centre",
       withoutEnlargement: true,
+      kernel: sharp.kernel.lanczos3,
     })
-    .jpeg({ quality: 82, mozjpeg: true })
+    .jpeg({
+      quality: 88,
+      mozjpeg: true,
+      chromaSubsampling: "4:4:4",
+    })
     .toFile(paths.thumb);
 
   await updateMemoryMedia(pool, mediaId, {
@@ -305,7 +554,7 @@ async function processJob(job) {
     image_width: width,
     image_height: height,
     image_aspect_ratio: aspectRatio,
-    image_orientation: orientation,
+    image_orientation: smartKind,
   });
 
   await updateMemoryPhotoUrl(pool, memoryId, authorId);
@@ -314,7 +563,7 @@ async function processJob(job) {
     width,
     height,
     aspect_ratio: aspectRatio,
-    orientation,
+    orientation: smartKind,
   });
 
   try {
@@ -326,6 +575,14 @@ async function processJob(job) {
     mediaId,
     memoryId,
     authorId,
+    geometry,
+    smartKind,
+    collageMode: visualScore.collageMode,
+    logoLike: visualScore.logoLike,
+    gridScore: visualScore.gridScore,
+    feedCanvas: `${feedVariant.canvas.width}x${feedVariant.canvas.height}`,
+    mode: feedVariant.canvas.mode,
+    cleanCanvas: feedVariant.canvas.cleanCanvas,
   });
 
   return {
@@ -333,6 +590,22 @@ async function processJob(job) {
     mediaId,
     memoryId,
     authorId,
+    source: {
+      width,
+      height,
+      aspectRatio,
+      geometry,
+    },
+    visualScore,
+    feedVariant: {
+      width: feedVariant.canvas.width,
+      height: feedVariant.canvas.height,
+      inset: feedVariant.canvas.inset,
+      kind: smartKind,
+      mode: feedVariant.canvas.mode,
+      cleanCanvas: feedVariant.canvas.cleanCanvas,
+      contract: "smart-media-pipeline-v1.1-clean-canvas",
+    },
   };
 }
 
@@ -362,6 +635,7 @@ worker.on("failed", async (job, err) => {
     if (!mediaId) return;
 
     const pool = await getPool();
+
     await updateMemoryMedia(pool, mediaId, {
       updated_at: new Date(),
       processing_status: "failed",

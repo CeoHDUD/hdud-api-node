@@ -35,6 +35,7 @@ import authorsRouter from "./routes/authors.js";
 import chaptersRouter from "./routes/chapters.js";
 import timelineRouter from "./routes/timeline.js";
 import networkRouter from "./routes/network.js";
+import narrativeRoutes from "./routes/narrative.js";
 
 import { authenticate } from "./middleware/auth.js";
 import { getPool, sql } from "./db.js";
@@ -115,6 +116,7 @@ app.get("/", (_req, res) => {
       "/authors",
       "/chapters",
       "/api/chapters",
+      "/api/narrative",
       "/feed",
       "/api/feed (alias)",
       "/timeline",
@@ -168,6 +170,17 @@ console.log("[ROUTE] OK /api/auth");
 app.use("/chapters", chaptersRouter);
 app.use("/api/chapters", chaptersRouter);
 app.use("/memory", memoryRouter);
+app.use("/api/memory", memoryRouter);
+
+// ========================================
+// HDUD AI Narrative Engine
+// ========================================
+// IMPORTANTE:
+// precisa vir ANTES das rotas amplas "/" e "/api"
+// para evitar captura pelo memoriesRouter.
+app.use("/api/narrative", narrativeRoutes);
+console.log("[ROUTE] OK /api/narrative [AI Narrative Engine]");
+
 app.use("/", memoriesRouter);
 app.use("/api", memoriesRouter);
 app.use("/authors", authorsRouter);
@@ -563,6 +576,13 @@ async function processMemoryPhotoVariants({ fileBuffer, outputDir, memoryId }) {
   const feedPath = path.join(outputDir, `${baseName}_feed.jpg`);
   const thumbPath = path.join(outputDir, `${baseName}_thumb.jpg`);
 
+  const FEED_WIDTH = Number(process.env.MEMORY_IMAGE_FEED_WIDTH || 1200);
+  const FEED_HEIGHT = Number(process.env.MEMORY_IMAGE_FEED_HEIGHT || 900);
+  const FEED_INSET = Math.max(
+    24,
+    Math.min(Number(process.env.MEMORY_IMAGE_FEED_INSET || 48), 120)
+  );
+
   const source = sharp(fileBuffer, { failOn: "none" }).rotate();
   const metadata = await source.metadata();
 
@@ -572,16 +592,59 @@ async function processMemoryPhotoVariants({ fileBuffer, outputDir, memoryId }) {
     width > 0 && height > 0 ? Number((width / height).toFixed(4)) : null;
   const orientation = classifyImageOrientation(width, height);
 
-  await source.clone().jpeg({ quality: 92, mozjpeg: true }).toFile(originalPath);
-
   await source
     .clone()
-    .resize(1200, 900, {
+    .jpeg({
+      quality: 92,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    })
+    .toFile(originalPath);
+
+  const background = await source
+    .clone()
+    .resize(FEED_WIDTH, FEED_HEIGHT, {
       fit: "cover",
       position: "centre",
-      withoutEnlargement: true,
+      withoutEnlargement: false,
+      kernel: sharp.kernel.lanczos3,
     })
-    .jpeg({ quality: 86, mozjpeg: true })
+    .blur(18)
+    .modulate({
+      brightness: 1.02,
+      saturation: 0.92,
+    })
+    .jpeg({
+      quality: 86,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    })
+    .toBuffer();
+
+  const foreground = await source
+    .clone()
+    .resize(FEED_WIDTH - FEED_INSET * 2, FEED_HEIGHT - FEED_INSET * 2, {
+      fit: "contain",
+      position: "centre",
+      withoutEnlargement: false,
+      kernel: sharp.kernel.lanczos3,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .sharpen({
+      sigma: 0.42,
+      m1: 0.62,
+      m2: 1.18,
+    })
+    .png()
+    .toBuffer();
+
+  await sharp(background)
+    .composite([{ input: foreground, gravity: "centre" }])
+    .jpeg({
+      quality: 90,
+      mozjpeg: true,
+      chromaSubsampling: "4:2:0",
+    })
     .toFile(feedPath);
 
   await source
@@ -605,6 +668,9 @@ async function processMemoryPhotoVariants({ fileBuffer, outputDir, memoryId }) {
       height: height || null,
       aspect_ratio: aspectRatio,
       orientation,
+      feed_contract: "editorial-contain-canvas-v2",
+      feed_width: FEED_WIDTH,
+      feed_height: FEED_HEIGHT,
     },
   };
 }
@@ -1264,28 +1330,23 @@ if (multer) {
           WHERE media_id = @media_id;
         `);
 
-      if (
-        typeof row.memory_id === "number" ||
-        Number.isInteger(Number(row.memory_id))
-      ) {
-        try {
-          await pool
-            .request()
-            .input("memory_id", sql.Int, memoryId)
-            .input("origin_type", sql.VarChar(30), "narrated_audio")
-            .query(`
-              IF COL_LENGTH('dbo.identity_memory', 'origin_type') IS NOT NULL
-              BEGIN
-                UPDATE dbo.identity_memory
-                SET origin_type = CASE
-                    WHEN origin_type IS NULL OR LTRIM(RTRIM(origin_type)) = '' THEN @origin_type
-                    ELSE origin_type
-                END
-                WHERE memory_id = @memory_id;
+      try {
+        await pool
+          .request()
+          .input("memory_id", sql.Int, memoryId)
+          .input("origin_type", sql.VarChar(30), "narrated_audio")
+          .query(`
+            IF COL_LENGTH('dbo.identity_memory', 'origin_type') IS NOT NULL
+            BEGIN
+              UPDATE dbo.identity_memory
+              SET origin_type = CASE
+                  WHEN origin_type IS NULL OR LTRIM(RTRIM(origin_type)) = '' THEN @origin_type
+                  ELSE origin_type
               END
-            `);
-        } catch {}
-      }
+              WHERE memory_id = @memory_id;
+            END
+          `);
+      } catch {}
 
       return res.status(201).json({
         ok: true,
@@ -1317,54 +1378,6 @@ if (multer) {
 
   app.post("/memory/:id/audio", authenticate, uploadAudio.single("file"), handleMemoryAudioUpload);
   app.post("/api/memory/:id/audio", authenticate, uploadAudio.single("file"), handleMemoryAudioUpload);
-} else {
-  app.post("/me/avatar", authenticate, (_req, res) => {
-    return res.status(501).json({
-      error: "Upload não habilitado.",
-      detail:
-        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /me/avatar.",
-    });
-  });
-
-  app.post("/api/me/avatar", authenticate, (_req, res) => {
-    return res.status(501).json({
-      error: "Upload não habilitado.",
-      detail:
-        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/me/avatar.",
-    });
-  });
-
-  app.post("/memory/:id/photo", authenticate, (_req, res) => {
-    return res.status(501).json({
-      error: "Upload não habilitado.",
-      detail:
-        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /memory/:id/photo.",
-    });
-  });
-
-  app.post("/api/memory/:id/photo", authenticate, (_req, res) => {
-    return res.status(501).json({
-      error: "Upload não habilitado.",
-      detail:
-        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/memory/:id/photo.",
-    });
-  });
-
-  app.post("/memory/:id/audio", authenticate, (_req, res) => {
-    return res.status(501).json({
-      error: "Upload não habilitado.",
-      detail:
-        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /memory/:id/audio.",
-    });
-  });
-
-  app.post("/api/memory/:id/audio", authenticate, (_req, res) => {
-    return res.status(501).json({
-      error: "Upload não habilitado.",
-      detail:
-        "Dependência 'multer' não encontrada. Instale 'multer' no hdud-api-node para habilitar /api/memory/:id/audio.",
-    });
-  });
 }
 
 async function handleFeed(req, res, next) {
@@ -1727,78 +1740,6 @@ async function handleFeed(req, res, next) {
     const memoryCount = legacyItems.filter((x) => x.type === "memory").length;
     const chapterCount = legacyItems.filter((x) => x.type === "chapter").length;
 
-    const wantsV01 = v === "0.1" || v === "v0.1" || v === "1";
-
-    if (wantsV01) {
-      const v01Items = legacyItems.map((it) => {
-        const kind = String(it.type || "").toLowerCase();
-        const activityAt = it?.meta?.activity_at || it?.date || new Date().toISOString();
-
-        const idNum = Number(it?.source_id);
-        const id = Number.isFinite(idNum) && idNum > 0 ? idNum : String(it?.source_id ?? "");
-
-        const obj = {
-          kind,
-          id,
-          title: normalizeText(it?.title, "(sem título)"),
-          nav: it?.meta?.nav || "/",
-          preview: it?.meta?.preview || it?.meta?.description || null,
-          photoUrl: it?.photoUrl ?? it?.meta?.photo_url ?? null,
-          meta: {
-            phase_code: it?.meta?.phase_code ?? null,
-            chapter_id: it?.meta?.chapter_id ?? null,
-            status: it?.meta?.status ?? null,
-            publication_status: it?.meta?.publication_status ?? null,
-            published_at: it?.meta?.published_at ?? null,
-            photo_url: it?.meta?.photo_url ?? null,
-            author_id: it?.meta?.author_id ?? it?.authorId ?? null,
-            author_name: it?.meta?.author_name ?? it?.authorName ?? null,
-            author_code: it?.meta?.author_code ?? it?.authorCode ?? null,
-            relationship_type: it?.meta?.relationship_type ?? it?.relationshipType ?? null,
-            origin_scope: it?.meta?.origin_scope ?? it?.originScope ?? null,
-            relevance_score: it?.meta?.relevance_score ?? it?.relevanceScore ?? null,
-          },
-        };
-
-        const activityIso = new Date(safeDateMs(activityAt) ?? Date.now()).toISOString();
-
-        return {
-          actor: {
-            author_id: it?.meta?.author_id ?? it?.authorId ?? actorV01.author_id,
-            name_public: it?.meta?.author_name ?? it?.authorName ?? actorV01.name_public,
-            avatar_url: null,
-          },
-          kind,
-          action: "published",
-          activity_at: activityIso,
-          object: obj,
-        };
-      });
-
-      return res.json({
-        version: "FEED_v0.1",
-        actor: actorV01,
-        items: v01Items,
-        meta: {
-          generated_at: new Date().toISOString(),
-          limit,
-          truth_mode: "published_only",
-          scope_mode: "self_and_network",
-          ordering_mode: "relevance_then_recency",
-          summary: {
-            counts: {
-              memories: memoryCount,
-              chapters: chapterCount,
-            },
-          },
-        },
-        legacy: {
-          profile: profileLegacy,
-          items: legacyItems,
-        },
-      });
-    }
-
     return res.json({
       profile: profileLegacy,
       items: legacyItems,
@@ -1837,6 +1778,7 @@ console.log("[ROUTE] OK /feed");
 console.log("[ROUTE] OK /api/feed (alias)");
 console.log("[ROUTE] OK /network");
 console.log("[ROUTE] OK /api/network");
+console.log("[ROUTE] OK /api/narrative [AI Narrative Engine]");
 console.log("[ROUTE] OK /profile (PUT) [legacy]");
 console.log("[ROUTE] OK /me/profile (GET,PUT) [PROFILE_v1]");
 console.log("[ROUTE] OK /api/me/profile (GET,PUT) [alias]");
