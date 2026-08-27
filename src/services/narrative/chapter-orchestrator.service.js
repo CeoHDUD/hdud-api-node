@@ -1,6 +1,7 @@
 // C:\HDUD_DATA\hdud-api-node\src\services\narrative\chapter-orchestrator.service.js
 
 import OpenAI from "openai";
+import { assertExternalAIAllowed, extractOpenAIUsage, recordExternalAIUsage } from "../ai-cost-usage.service.js";
 
 const DEFAULT_MODEL =
   process.env.OPENAI_NARRATIVE_MODEL ||
@@ -127,6 +128,7 @@ export async function orchestrateNarrativeChapter({
       normalizedMemories,
   };
 
+  await assertExternalAIAllowed({ authorId: author?.author_id });
   const response =
     await client.responses.create({
 
@@ -189,6 +191,12 @@ RESPONDA EXCLUSIVAMENTE EM JSON:
       input:
         JSON.stringify(payload),
     });
+
+  await recordExternalAIUsage({
+    authorId: author?.author_id, operationCode: "NARRATIVE_CHAPTER_ORCHESTRATION",
+    model: response?.model || DEFAULT_MODEL, ...extractOpenAIUsage(response),
+    entityType: "CHAPTER_DRAFT", metadata: { source_memory_count: normalizedMemories.length },
+  });
 
   const text =
     response.output_text || "";

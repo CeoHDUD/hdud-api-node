@@ -1,6 +1,7 @@
 // C:\HDUD_DATA\hdud-api-node\src\services\narrative\voice-profile.service.js
 
 import OpenAI from "openai";
+import { assertExternalAIAllowed, extractOpenAIUsage, recordExternalAIUsage } from "../ai-cost-usage.service.js";
 
 const DEFAULT_MODEL =
   process.env.OPENAI_NARRATIVE_MODEL || "gpt-4.1";
@@ -50,6 +51,7 @@ export async function generateVoiceProfile({
     })),
   };
 
+  await assertExternalAIAllowed({ authorId });
   const response =
     await client.responses.create({
       model: DEFAULT_MODEL,
@@ -89,6 +91,12 @@ RESPONDA EXCLUSIVAMENTE EM JSON:
 `,
       input: JSON.stringify(payload),
     });
+
+  await recordExternalAIUsage({
+    authorId, operationCode: "VOICE_PROFILE_GENERATION", model: response?.model || DEFAULT_MODEL,
+    ...extractOpenAIUsage(response), entityType: "AUTHOR", entityId: authorId,
+    metadata: { source_memory_count: memories.length },
+  });
 
   const text = response.output_text || "";
 

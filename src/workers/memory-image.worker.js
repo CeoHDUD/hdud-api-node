@@ -16,8 +16,9 @@ const PUBLIC_DIR = path.join(process.cwd(), "public");
 const FEED_WIDTH = Number(process.env.MEMORY_IMAGE_FEED_WIDTH || 1080);
 const FEED_HEIGHT = Number(process.env.MEMORY_IMAGE_FEED_HEIGHT || 1350);
 const THUMB_SIZE = Number(process.env.MEMORY_IMAGE_THUMB_SIZE || 500);
+const COLLAGE_FEED_SIZE = Number(process.env.MEMORY_IMAGE_FEED_COLLAGE_SIZE || 1080);
 
-const CLEAN_CANVAS_BG = Object.freeze({ r: 242, g: 242, b: 244 });
+const CLEAN_CANVAS_BG = Object.freeze({ r: 255, g: 255, b: 255 });
 
 const FEED_CANVAS = Object.freeze({
   portrait: {
@@ -65,15 +66,15 @@ const FEED_CANVAS = Object.freeze({
     cleanCanvas: false,
   },
   collage: {
-    width: FEED_WIDTH,
-    height: FEED_HEIGHT,
-    mode: "collage_clean_canvas",
-    inset: Number(process.env.MEMORY_IMAGE_FEED_COLLAGE_INSET || 36),
-    foregroundFit: "contain",
-    backgroundBlur: 0,
-    backgroundBrightness: 1,
-    backgroundSaturation: 1,
-    cleanCanvas: true,
+	width: 1080,
+	height: 1080,
+	mode: "collage_editorial_square",
+	inset: 0,
+	foregroundFit: "contain",
+	backgroundBlur: 0,
+	backgroundBrightness: 1,
+	backgroundSaturation: 1,
+	cleanCanvas: true,
   },
   logo: {
     width: FEED_WIDTH,
@@ -104,7 +105,7 @@ console.log("[WORKER][MEMORY_IMAGE] starting...", {
   concurrency: WORKER_CONCURRENCY,
   publicDir: PUBLIC_DIR,
   feedVariant: `${FEED_WIDTH}x${FEED_HEIGHT}`,
-  contract: "smart-media-pipeline-v1.1-clean-canvas",
+  contract: "smart-media-pipeline-v1.2-feed-go-live",
 });
 
 function toInt(v) {
@@ -452,7 +453,40 @@ async function renderForeground(base, canvas) {
     .toBuffer();
 }
 
+async function renderEditorialCollageFeed(buffer) {
+  const canvas = resolveFeedCanvas("collage");
+
+  const output = await sharp(buffer, { failOn: "none" })
+    .rotate()
+    .resize(canvas.width, canvas.height, {
+      fit: "cover",
+      position: "centre",
+      withoutEnlargement: false,
+      kernel: sharp.kernel.lanczos3,
+    })
+    .sharpen({
+      sigma: 0.34,
+      m1: 0.48,
+      m2: 0.96,
+    })
+    .jpeg({
+      quality: 94,
+      mozjpeg: true,
+      chromaSubsampling: "4:4:4",
+    })
+    .toBuffer();
+
+  return {
+    buffer: output,
+    canvas,
+  };
+}
+
 async function renderFeedVariant(buffer, smartKind = "unknown") {
+  if (String(smartKind || "").toLowerCase() === "collage") {
+    return renderEditorialCollageFeed(buffer);
+  }
+
   const base = sharp(buffer, { failOn: "none" }).rotate();
   const canvas = resolveFeedCanvas(smartKind);
 
@@ -604,7 +638,7 @@ async function processJob(job) {
       kind: smartKind,
       mode: feedVariant.canvas.mode,
       cleanCanvas: feedVariant.canvas.cleanCanvas,
-      contract: "smart-media-pipeline-v1.1-clean-canvas",
+      contract: "smart-media-pipeline-v1.2-feed-go-live",
     },
   };
 }

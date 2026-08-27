@@ -1,6 +1,7 @@
 // C:\HDUD_DATA\hdud-api-node\src\services\narrative\openai-narrative.service.js
 
 import OpenAI from "openai";
+import { assertExternalAIAllowed, extractOpenAIUsage, recordExternalAIUsage } from "../ai-cost-usage.service.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_NARRATIVE_MODEL || "gpt-4.1";
 
@@ -42,6 +43,7 @@ export async function generateNarrativeChapterWithOpenAI({ memories, options = {
     })),
   };
 
+  await assertExternalAIAllowed({ authorId: options?.authorId || memories?.[0]?.author_id });
   const response = await client.responses.create({
     model: DEFAULT_MODEL,
     instructions: `
@@ -69,6 +71,13 @@ FORMATO:
 }
 `,
     input: JSON.stringify(payload),
+  });
+
+  await recordExternalAIUsage({
+    authorId: options?.authorId || memories?.[0]?.author_id,
+    operationCode: "NARRATIVE_CHAPTER_GENERATION", model: response?.model || DEFAULT_MODEL,
+    ...extractOpenAIUsage(response), entityType: "CHAPTER_DRAFT",
+    metadata: { source_memory_count: memories.length },
   });
 
   const text = response.output_text || "";

@@ -1,6 +1,7 @@
 // C:\HDUD_DATA\hdud-api-node\src\services\narrative\chapter-orchestrator.service.js
 
 import OpenAI from "openai";
+import { assertExternalAIAllowed, extractOpenAIUsage, recordExternalAIUsage } from "../ai-cost-usage.service.js";
 import { loadAuthorNarrativeContext } from "./narrative-orchestrator.service.js";
 import { buildAutobiographicalCognition } from "./autobiographical-cognition.service.js";
 import { recallConnectedMemories } from "./memory-recall.service.js";
@@ -99,6 +100,7 @@ export async function orchestrateNarrativeChapter({
     options,
   };
 
+  await assertExternalAIAllowed({ authorId });
   const response = await client.responses.create({
     model: DEFAULT_MODEL,
     instructions: `
@@ -156,6 +158,12 @@ RESPONDA EXCLUSIVAMENTE EM JSON:
 }
 `,
     input: JSON.stringify(payload),
+  });
+
+  await recordExternalAIUsage({
+    authorId, operationCode: "NARRATIVE_CHAPTER_ORCHESTRATION",
+    model: response?.model || DEFAULT_MODEL, ...extractOpenAIUsage(response),
+    entityType: "CHAPTER_DRAFT", metadata: { source_memory_count: ids.length },
   });
 
   const text = response.output_text || "";

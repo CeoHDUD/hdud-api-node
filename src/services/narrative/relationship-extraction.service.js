@@ -1,6 +1,7 @@
 // C:\HDUD_DATA\hdud-api-node\src\services\narrative\relationship-extraction.service.js
 
 import OpenAI from "openai";
+import { assertExternalAIAllowed, extractOpenAIUsage, recordExternalAIUsage } from "../ai-cost-usage.service.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_NARRATIVE_MODEL || "gpt-4.1";
 
@@ -157,6 +158,7 @@ export async function extractNarrativeRelationships({ memory, entities = [] }) {
     entities: normalizedEntities,
   };
 
+  await assertExternalAIAllowed({ authorId: memory?.author_id });
   const response = await client.responses.create({
     model: DEFAULT_MODEL,
     instructions: `
@@ -217,6 +219,12 @@ RESPONDA EXCLUSIVAMENTE EM JSON:
 }
 `,
     input: JSON.stringify(payload),
+  });
+
+  await recordExternalAIUsage({
+    authorId: memory?.author_id, operationCode: "NARRATIVE_RELATIONSHIP_EXTRACTION",
+    model: response?.model || DEFAULT_MODEL, ...extractOpenAIUsage(response),
+    entityType: "MEMORY", entityId: memory?.memory_id,
   });
 
   const text = response.output_text || "";

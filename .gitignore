@@ -31,3 +31,14 @@ temp/
 # OPTIONAL
 *.sqlite
 *.db
+
+# DELIVERY / BACKUPS
+*.zip
+*.7z
+*.rar
+
+# RUNTIME STORAGE
+storage/
+
+# USER AVATARS
+public/avatars/

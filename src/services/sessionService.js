@@ -28,59 +28,51 @@ function normalizeDate(value) {
 }
 
 /**
- * Cria uma nova sessão de refresh token para um author.
+ * Cria uma nova sessão de refresh token vinculada à identidade humana
+ * e a um contexto explícito de uso.
  */
 export async function createSession({
-  authorId,
+  userId,
+  authorId = null,
+  sessionContext,
   expiresAt,
   createdIp,
   userAgent,
 }) {
-  if (!authorId) {
-    throw new Error("createSession requer authorId válido.");
+  if (!userId) throw new Error("createSession requer userId válido.");
+
+  const normalizedContext = String(sessionContext || "").trim().toUpperCase();
+  if (!["AUTHOR", "OPERATOR"].includes(normalizedContext)) {
+    throw new Error("createSession requer sessionContext AUTHOR ou OPERATOR.");
+  }
+  if (normalizedContext === "AUTHOR" && !authorId) {
+    throw new Error("createSession AUTHOR requer authorId válido.");
   }
 
   const normalizedExpiresAt = normalizeDate(expiresAt);
-  if (!normalizedExpiresAt) {
-    throw new Error("createSession requer expiresAt válido.");
-  }
+  if (!normalizedExpiresAt) throw new Error("createSession requer expiresAt válido.");
 
   const pool = await getPool();
   const refreshToken = generateRefreshToken();
-
-  const result = await pool
-    .request()
-    .input("author_id", sql.BigInt, Number(authorId))
+  const result = await pool.request()
+    .input("user_id", sql.Int, Number(userId))
+    .input("author_id", sql.BigInt, authorId ? Number(authorId) : null)
+    .input("session_context", sql.VarChar(20), normalizedContext)
     .input("refresh_token", sql.UniqueIdentifier, refreshToken)
     .input("expires_at", sql.DateTime2, normalizedExpiresAt)
     .input("created_ip", sql.VarChar(45), createdIp || null)
     .input("user_agent", sql.NVarChar(255), userAgent || null)
     .query(`
       INSERT INTO dbo.identity_session (
-          author_id,
-          refresh_token,
-          expires_at,
-          created_ip,
-          user_agent
+        user_id, author_id, session_context, refresh_token,
+        expires_at, created_ip, user_agent
       )
-      OUTPUT
-          INSERTED.session_id,
-          INSERTED.author_id,
-          INSERTED.refresh_token,
-          INSERTED.expires_at,
-          INSERTED.is_revoked,
-          INSERTED.created_at,
-          INSERTED.created_ip,
-          INSERTED.user_agent
+      OUTPUT INSERTED.*
       VALUES (
-          @author_id,
-          @refresh_token,
-          @expires_at,
-          @created_ip,
-          @user_agent
+        @user_id, @author_id, @session_context, @refresh_token,
+        @expires_at, @created_ip, @user_agent
       );
     `);
-
   return result.recordset[0] || null;
 }
 
@@ -98,7 +90,9 @@ export async function getActiveSessionByRefreshToken(refreshToken) {
     .query(`
       SELECT TOP 1
         session_id,
+        user_id,
         author_id,
+        session_context,
         refresh_token,
         expires_at,
         is_revoked,

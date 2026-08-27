@@ -23,6 +23,9 @@ export function authenticate(req, res, next) {
 
   try {
     req.user = jwt.verify(token, JWT_SECRET);
+    console.log("===== JWT AUTHENTICATE =====");
+    console.log(req.user);
+    console.log("============================");
     return next();
   } catch (err) {
     return res.status(401).json({
@@ -39,6 +42,9 @@ export function authRequired(req, res, next) {
 
   try {
     req.user = jwt.verify(token, JWT_SECRET);
+    console.log("===== JWT AUTHENTICATE =====");
+    console.log(req.user);
+    console.log("============================");
     return next();
   } catch (err) {
     return res.status(401).json({

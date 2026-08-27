@@ -1,17 +1,28 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
   <head>
-    <title>HDUD API — Redoc v0.5</title>
-    <meta charset="utf-8"/>
+    <meta charset="utf-8" />
+    <title>HDUD Core API — ReDoc</title>
+
+    <!-- ReDoc standalone -->
     <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+      }
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      redoc {
+        height: 100vh;
+      }
+    </style>
   </head>
-  <body style="margin:0; background:#000;">
-    <redoc spec-url="/docs/openapi.json" 
-      theme='{
-        "colors": { "primary": { "main": "#0066ff" } },
-        "typography": { "fontSize":"16px" },
-        "rightPanel": { "backgroundColor":"#111" }
-      }'>
-    </redoc>
+  <body>
+    <!-- Aqui o ReDoc carrega o JSON da própria API -->
+    <redoc spec-url="/docs/openapi.json"></redoc>
   </body>
 </html>

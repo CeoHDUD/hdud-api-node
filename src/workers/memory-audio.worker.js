@@ -8,6 +8,7 @@ import { Worker } from "bullmq";
 import { getPool, sql } from "../db.js";
 import { getRedisConnection } from "../queue/redis.js";
 import { MEMORY_AUDIO_QUEUE_NAME } from "../queue/memory-audio.queue.js";
+import { assertExternalAIAllowed, recordExternalAIUsage } from "../services/ai-cost-usage.service.js";
 
 const WORKER_CONCURRENCY = Number(
   process.env.MEMORY_AUDIO_WORKER_CONCURRENCY || 1
@@ -45,11 +46,52 @@ function safeNowIso() {
   return new Date().toISOString();
 }
 
-function ensureAbsolutePath(filePath) {
+const PUBLIC_DIR = path.resolve(
+  process.env.HDUD_PUBLIC_DIR || path.join(process.cwd(), "public")
+);
+
+async function pathExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveAudioAbsolutePath(filePath) {
   const p = normalizeString(filePath);
   if (!p) return null;
-  if (path.isAbsolute(p)) return p;
-  return path.join(process.cwd(), p);
+
+  const normalizedRelative = p.replace(/^[/\\]+/, "");
+  const candidates = path.isAbsolute(p)
+    ? [p]
+    : [
+        path.resolve(PUBLIC_DIR, normalizedRelative),
+        path.resolve(process.cwd(), normalizedRelative),
+      ];
+
+  for (const candidate of candidates) {
+    if (await pathExists(candidate)) return candidate;
+  }
+
+  // Fallback defensivo: se o storage_path apontar para uma extensão antiga,
+  // procura qualquer original.* no mesmo diretório de mídia.
+  const preferred = candidates[0];
+  const mediaDir = preferred ? path.dirname(preferred) : null;
+  if (mediaDir && (await pathExists(mediaDir))) {
+    try {
+      const entries = await fs.readdir(mediaDir, { withFileTypes: true });
+      const original = entries.find(
+        (entry) => entry.isFile() && /^original\./i.test(entry.name)
+      );
+      if (original) return path.join(mediaDir, original.name);
+    } catch {
+      // segue para o erro original abaixo
+    }
+  }
+
+  return preferred || null;
 }
 
 function buildMockTranscript({ memoryId, mediaId, audioSeconds }) {
@@ -526,7 +568,7 @@ async function tryMirrorTranscriptIntoMemory(pool, mediaTable, context, transcri
 }
 
 async function readAudioBuffer(filePath) {
-  const absolutePath = ensureAbsolutePath(filePath);
+  const absolutePath = await resolveAudioAbsolutePath(filePath);
   if (!absolutePath) {
     throw new Error("Caminho do áudio não encontrado.");
   }
@@ -549,6 +591,12 @@ async function transcribeWithOpenAI(filePath) {
   const response = await client.audio.transcriptions.create({
     file: new File([buffer], fileName),
     model: OPENAI_MODEL,
+    prompt: [
+      "Contexto de vocabulário da HDUD.",
+      "HDUD é a sigla de Histórias de um Desconhecido até então.",
+      "Quando a sigla for pronunciada, transcreva exatamente como HDUD, nunca VDUD, HDOD ou variações semelhantes.",
+      "Preserve nomes próprios, siglas e termos do produto conforme esse contexto."
+    ].join(" "),
   });
 
   const text =
@@ -579,6 +627,21 @@ function shouldUseMock({ userContext, jobData }) {
     .toLowerCase();
 
   return envMock === "1" || envMock === "true" || envMock === "yes";
+}
+
+async function reserveAudioQuota(pool, userId, seconds) {
+  const result = await pool.request().input("user_id", sql.BigInt, Number(userId)).input("audio_seconds", sql.Int, Number(seconds)).execute("dbo.p_ReserveAudioTranscriptionQuota");
+  return result?.recordset?.[0] || null;
+}
+
+async function commitAudioQuota(pool, userId, seconds) {
+  const result = await pool.request().input("user_id", sql.BigInt, Number(userId)).input("audio_seconds", sql.Int, Number(seconds)).execute("dbo.p_CommitAudioTranscriptionQuota");
+  return result?.recordset?.[0] || null;
+}
+
+async function releaseAudioQuota(pool, userId, seconds) {
+  const result = await pool.request().input("user_id", sql.BigInt, Number(userId)).input("audio_seconds", sql.Int, Number(seconds)).execute("dbo.p_ReleaseAudioTranscriptionQuota");
+  return result?.recordset?.[0] || null;
 }
 
 async function processJob(job) {
@@ -627,9 +690,44 @@ async function processJob(job) {
     jobData: { planCode: inputPlanCode },
   });
 
-  const transcript = useMock
-    ? buildMockTranscript(effectiveContext)
-    : await transcribeWithOpenAI(effectiveContext.filePath);
+  const billableSeconds = Math.max(1, Number(effectiveContext.audioSeconds || 0));
+  const reservation = await reserveAudioQuota(pool, effectiveContext.userId, billableSeconds);
+  if (Number(reservation?.allowed ?? 0) !== 1) {
+    const err = new Error("A franquia mensal de áudio/transcrição foi atingida.");
+    err.code = reservation?.reason_code || "PLAN_MONTHLY_QUOTA_EXCEEDED";
+    throw err;
+  }
+
+  let transcript;
+  try {
+    if (!useMock) {
+      await assertExternalAIAllowed({ pool, userId: effectiveContext.userId, authorId: effectiveContext.authorId });
+    }
+
+    transcript = useMock
+      ? buildMockTranscript(effectiveContext)
+      : await transcribeWithOpenAI(effectiveContext.filePath);
+
+    if (!useMock) {
+    await recordExternalAIUsage({
+      pool,
+      userId: effectiveContext.userId,
+      authorId: effectiveContext.authorId,
+      operationCode: "AUDIO_TRANSCRIPTION",
+      model: OPENAI_MODEL,
+      audioSeconds: effectiveContext.audioSeconds || 0,
+      entityType: "MEMORY_MEDIA",
+      entityId: effectiveContext.mediaId,
+      requestKey: job?.id ? `memory-audio:${job.id}` : null,
+      metadata: { memory_id: effectiveContext.memoryId },
+    });
+    }
+
+    await commitAudioQuota(pool, effectiveContext.userId, billableSeconds);
+  } catch (err) {
+    await releaseAudioQuota(pool, effectiveContext.userId, billableSeconds).catch(() => null);
+    throw err;
+  }
 
   await updateMediaStatus(pool, mediaTable, effectiveContext.mediaId, {
     transcriptionStatus: "DONE",

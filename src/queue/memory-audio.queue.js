@@ -28,7 +28,9 @@ export function getMemoryAudioQueue() {
 }
 
 export function buildMemoryAudioJobId(mediaId) {
-  return `memory-audio_${Number(mediaId)}`;
+  const stamp = Date.now();
+  const nonce = Math.random().toString(36).slice(2, 8);
+  return `memory-audio_${Number(mediaId)}_${stamp}_${nonce}`;
 }
 
 export async function enqueueMemoryAudioTranscriptionJob({
@@ -40,8 +42,13 @@ export async function enqueueMemoryAudioTranscriptionJob({
   planCode = null,
 }) {
   const queue = getMemoryAudioQueue();
+  const jobId = buildMemoryAudioJobId(mediaId);
 
-  return queue.add(
+  console.log(
+    `[memory-audio.queue] enqueue queue=${MEMORY_AUDIO_QUEUE_NAME} jobId=${jobId} mediaId=${Number(mediaId)} memoryId=${Number(memoryId)}`
+  );
+
+  const job = await queue.add(
     "transcribe",
     {
       memoryId: Number(memoryId),
@@ -60,7 +67,13 @@ export async function enqueueMemoryAudioTranscriptionJob({
       requestedAt: new Date().toISOString(),
     },
     {
-      jobId: buildMemoryAudioJobId(mediaId),
+      jobId,
     }
   );
+
+  console.log(
+    `[memory-audio.queue] queued queue=${MEMORY_AUDIO_QUEUE_NAME} jobId=${job.id} mediaId=${Number(mediaId)}`
+  );
+
+  return job;
 }

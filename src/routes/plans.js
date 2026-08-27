@@ -9,28 +9,85 @@ router.get("/", async (_req, res) => {
   try {
     const pool = await getPool();
 
-    const result = await pool.request().query(`
-      SELECT
-        plan_id,
-        code,
-        name,
-        max_audio_seconds,
-        monthly_seconds,
-        price_cents,
-        currency_code,
-        marketing_label,
-        is_featured,
-        description_short,
-        is_active,
-        sort_order
-      FROM dbo.subscription_plan
-      WHERE ISNULL(is_active, 1) = 1
-      ORDER BY
-        CASE WHEN sort_order IS NULL THEN 999999 ELSE sort_order END ASC,
-        plan_id ASC;
-    `);
+    const [plansResult, featuresResult] = await Promise.all([
+      pool.request().query(`
+        SELECT
+          sp.plan_id,
+          sp.code,
+          sp.name,
+          sp.max_audio_seconds,
+          sp.monthly_seconds,
+          sp.price_cents,
+          sp.currency_code,
+          sp.marketing_label,
+          sp.is_featured,
+          sp.description_short,
+          sp.is_active,
+          sp.sort_order,
+          p.monthly_external_ai_budget_usd,
+          COALESCE(p.warning_pct, 80) AS ai_warning_pct,
+          COALESCE(p.critical_pct, 90) AS ai_critical_pct,
+          COALESCE(p.block_pct, 100) AS ai_block_pct,
+          COALESCE(p.hard_stop, 0) AS ai_hard_stop,
+          COALESCE(p.allow_overage, 0) AS ai_allow_overage,
+          COALESCE(p.overage_mode, 'BLOCK') AS ai_overage_mode
+        FROM dbo.subscription_plan sp
+        LEFT JOIN dbo.subscription_plan_ai_policy p ON p.plan_id = sp.plan_id
+        WHERE ISNULL(sp.is_active, 1) = 1
+          AND UPPER(LTRIM(RTRIM(ISNULL(sp.code, '')))) NOT IN ('INTERNAL', 'INTERNAL_PLAN')
+          AND UPPER(LTRIM(RTRIM(ISNULL(sp.name, '')))) <> 'INTERNAL PLAN'
+        ORDER BY
+          CASE WHEN sp.sort_order IS NULL THEN 999999 ELSE sp.sort_order END ASC,
+          sp.plan_id ASC;
+      `),
+      pool.request().query(`
+        SELECT
+          pf.plan_id,
+          f.code AS feature_code,
+          f.name AS feature_name,
+          f.value_type,
+          f.unit_code,
+          f.reset_policy,
+          f.enforcement_mode,
+          f.ledger_operation_code,
+          pf.bool_value,
+          pf.int_value,
+          pf.string_value
+        FROM dbo.subscription_plan_feature pf
+        INNER JOIN dbo.subscription_feature f
+          ON f.feature_id = pf.feature_id
+        WHERE pf.is_enabled = 1
+          AND f.is_active = 1
+        ORDER BY pf.plan_id, f.feature_id;
+      `),
+    ]);
 
-    const items = (result.recordset || []).map((row) => ({
+    const featuresByPlan = new Map();
+
+    for (const row of featuresResult.recordset || []) {
+      const planId = Number(row.plan_id);
+      if (!featuresByPlan.has(planId)) featuresByPlan.set(planId, []);
+
+      featuresByPlan.get(planId).push({
+        code: row.feature_code ? String(row.feature_code) : null,
+        name: row.feature_name ? String(row.feature_name) : null,
+        value_type: row.value_type ? String(row.value_type) : null,
+        unit_code: row.unit_code == null ? null : String(row.unit_code),
+        reset_policy: row.reset_policy ? String(row.reset_policy) : null,
+        enforcement_mode: row.enforcement_mode
+          ? String(row.enforcement_mode)
+          : null,
+        ledger_operation_code:
+          row.ledger_operation_code == null
+            ? null
+            : String(row.ledger_operation_code),
+        bool_value: row.bool_value == null ? null : !!row.bool_value,
+        int_value: row.int_value == null ? null : Number(row.int_value),
+        string_value: row.string_value == null ? null : String(row.string_value),
+      });
+    }
+
+    const items = (plansResult.recordset || []).map((row) => ({
       plan_id: Number(row.plan_id),
       code: row.code ? String(row.code) : null,
       name: row.name ? String(row.name) : null,
@@ -45,6 +102,19 @@ router.get("/", async (_req, res) => {
       description_short: row.description_short
         ? String(row.description_short)
         : null,
+      features: featuresByPlan.get(Number(row.plan_id)) || [],
+      ai_policy: {
+        monthly_external_ai_budget_usd:
+          row.monthly_external_ai_budget_usd != null
+            ? Number(row.monthly_external_ai_budget_usd)
+            : null,
+        warning_pct: Number(row.ai_warning_pct ?? 80),
+        critical_pct: Number(row.ai_critical_pct ?? 90),
+        block_pct: Number(row.ai_block_pct ?? 100),
+        hard_stop: !!row.ai_hard_stop,
+        allow_overage: !!row.ai_allow_overage,
+        overage_mode: String(row.ai_overage_mode || "BLOCK"),
+      },
     }));
 
     return res.json({

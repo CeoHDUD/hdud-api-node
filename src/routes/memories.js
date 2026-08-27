@@ -1,4 +1,4 @@
-﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js
+// C:\HDUD_DATA\hdud-api-node\src\routes\memories.js
 // Rotas deste arquivo:
 // - POST /memories                      -> (contrato) payload { content: string }
 // - GET  /memories                      -> inventário simples (items) + payload legado (memories)
@@ -13,8 +13,19 @@ import { authenticate } from "../middleware/auth.js";
 import { requireMemoryOwnership } from "../middleware/ownership.js";
 import { getPool, sql } from "../db.js";
 import { ROLES, userHasRole } from "../middleware/roles.js";
+import { regenerateEditorial } from "../services/memory-editorial-intelligence.service.js";
 
 const router = express.Router();
+
+async function classifyMemoryEditorialSafe({ memoryId, authorId, changedBy = null }) {
+  try {
+    const result = await regenerateEditorial({ memoryId, authorId, changedBy, forceLocal: true });
+    return { ok: true, result };
+  } catch (err) {
+    console.warn(`[MEI][memory ${memoryId}] classificação automática não bloqueou a memória:`, err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
 
 function canEditFromReq(req, authorId) {
   const tokenAuthorId = req.user?.author_id ?? null;
@@ -334,7 +345,9 @@ router.post("/memories", authenticate, async (req, res) => {
     const row = result?.recordset?.[0];
     if (!row) return res.status(500).json({ error: "Erro ao criar memória." });
 
-    const fresh = await selectMemoryById(pool, Number(row.memory_id));
+    const createdId = Number(row.memory_id);
+    await classifyMemoryEditorialSafe({ memoryId: createdId, authorId, changedBy: userCode });
+    const fresh = await selectMemoryById(pool, createdId);
     return res.status(201).json(attachMeta(fresh || row, req, authorId));
   } catch (err) {
     console.error("[POST /memories] erro:", err);
@@ -489,6 +502,7 @@ router.post("/authors/:authorId/memories", authenticate, async (req, res) => {
       }
     }
 
+    await classifyMemoryEditorialSafe({ memoryId: createdId, authorId, changedBy: userCode });
     const fresh = await selectMemoryById(pool, createdId);
     return res.status(201).json(attachMeta(fresh || row, req, authorId));
   } catch (err) {
@@ -639,6 +653,7 @@ router.put("/memories/:id", authenticate, async (req, res) => {
       await updateMemoryPhase(pool, memoryId, authorId, phaseIdResolved);
     }
 
+    await classifyMemoryEditorialSafe({ memoryId, authorId, changedBy: userCode });
     const fresh = await selectMemoryById(pool, memoryId);
     return res.json(fresh ? attachMeta(fresh, req, authorId) : { ok: true, memory_id: memoryId });
   } catch (err) {
@@ -647,6 +662,70 @@ router.put("/memories/:id", authenticate, async (req, res) => {
       error: "Falha ao atualizar memória",
       detail: err?.originalError?.info?.message || err?.message,
     });
+  }
+});
+
+
+// GO LIVE 010 — Lifecycle Editorial de Memória
+router.delete("/memories/:id", authenticate, async (req, res) => {
+  const memoryId = Number(req.params.id);
+  if (!Number.isInteger(memoryId) || memoryId <= 0) {
+    return res.status(400).json({ ok: false, error: "id inválido." });
+  }
+
+  const pool = await getPool();
+  const transaction = new sql.Transaction(pool);
+  try {
+    await transaction.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
+    const request = new sql.Request(transaction);
+    request.input("memory_id", sql.Int, memoryId);
+
+    const found = await request.query(`
+      SELECT TOP 1 memory_id, author_id, is_deleted
+      FROM dbo.identity_memory
+      WHERE memory_id=@memory_id;
+    `);
+    const row = found.recordset?.[0];
+    if (!row || Number(row.is_deleted) === 1) {
+      await transaction.rollback();
+      return res.status(404).json({ ok: false, error: "Memória não encontrada." });
+    }
+    const authorId = Number(row.author_id);
+    if (!canEditFromReq(req, authorId)) {
+      await transaction.rollback();
+      return res.status(403).json({ ok: false, error: "Permissão negada." });
+    }
+    request.input("author_id", sql.Int, authorId);
+
+    await request.query(`
+      -- Remove a memória das unidades editoriais ativas sem destruir versões.
+      DELETE FROM dbo.identity_memory_chapter
+      WHERE memory_id=@memory_id AND author_id=@author_id;
+
+      IF OBJECT_ID('dbo.identity_story_memory','U') IS NOT NULL
+        DELETE FROM dbo.identity_story_memory
+        WHERE memory_id=@memory_id AND author_id=@author_id;
+
+      IF OBJECT_ID('dbo.identity_memory_media','U') IS NOT NULL
+        UPDATE dbo.identity_memory_media
+        SET is_deleted=1, updated_at=SYSUTCDATETIME()
+        WHERE memory_id=@memory_id AND author_id=@author_id
+          AND COL_LENGTH('dbo.identity_memory_media','is_deleted') IS NOT NULL;
+
+      UPDATE dbo.identity_memory
+      SET is_deleted=1,
+          publication_status='DRAFT',
+          published_at=NULL,
+          archived_at=SYSUTCDATETIME()
+      WHERE memory_id=@memory_id AND author_id=@author_id
+        AND ISNULL(is_deleted,0)=0;
+    `);
+    await transaction.commit();
+    return res.json({ ok: true, memory_id: memoryId, deleted: true, lifecycle: "ARCHIVED" });
+  } catch (err) {
+    try { await transaction.rollback(); } catch {}
+    console.error("[DELETE /memories/:id] erro:", err);
+    return res.status(500).json({ error: "Falha ao excluir memória", detail: err?.originalError?.info?.message || err?.message });
   }
 });
 

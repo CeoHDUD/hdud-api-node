@@ -29,13 +29,29 @@ try {
 } catch {}
 
 import authRouter from "./routes/auth.js";
+import adminAuthRouter from "./routes/admin-auth.js";
+import adminProbeRouter from "./routes/admin-probe.js";
+import adminUsersAccessRouter from "./routes/admin-users-access.js";
+import adminPlansRouter from "./routes/admin-plans.js";
+import adminAiLedgerRouter from "./routes/admin-ai-ledger.js";
+import adminCampaignsRouter from "./routes/admin-campaigns.js";
+import adminAdsRouter from "./routes/admin-ads.js";
+import adminMetricsRouter from "./routes/admin-metrics.js";
+import campaignsRouter from "./routes/campaigns.js";
+import adsRouter from "./routes/ads.js";
 import memoryRouter from "./routes/memory.js";
 import memoriesRouter from "./routes/memories.js";
 import authorsRouter from "./routes/authors.js";
 import chaptersRouter from "./routes/chapters.js";
+import booksRouter from "./routes/books.js";
 import timelineRouter from "./routes/timeline.js";
 import networkRouter from "./routes/network.js";
+import messagesRouter from "./routes/messages.js";
+import notificationsRouter from "./routes/notifications.js";
 import narrativeRoutes from "./routes/narrative.js";
+import memoryEditorialRouter from "./routes/memory-editorial.js";
+import storiesRouter from "./routes/stories.js";
+import taxonomyRouter from "./routes/taxonomy.js";
 
 import { authenticate } from "./middleware/auth.js";
 import { getPool, sql } from "./db.js";
@@ -48,6 +64,11 @@ const SERVICE_VERSION =
   "HDUD-API-Node v0.6";
 
 const app = express();
+
+// HDUD Ads / telemetria: existe um único reverse proxy Nginx entre o browser e a API
+// no deployment Docker oficial. Isso permite que req.ip represente o cliente enviado
+// pelo proxy, sem confiar indiscriminadamente em X-Forwarded-For de múltiplos hops.
+app.set("trust proxy", 1);
 
 function forceHeadersOnWriteHead(res, fn) {
   const origWriteHead = res.writeHead;
@@ -105,6 +126,9 @@ app.get("/", (_req, res) => {
     routes: [
       "/auth",
       "/api/auth",
+      "/api/admin/auth",
+      "/api/admin/probe (GET) [ADMIN_AUTHZ_04]",
+      "/api/campaigns/active?placement=DASHBOARD (GET) [CAMPAIGN_DELIVERY_09_04]",
       "/memory",
       "/memory/:id/audio (GET, POST multipart) [MEMORY_AUDIO_v1]",
       "/memory/:id/audio/:mediaId (GET) [MEMORY_AUDIO_v1]",
@@ -117,12 +141,27 @@ app.get("/", (_req, res) => {
       "/chapters",
       "/api/chapters",
       "/api/narrative",
+      "/stories",
+      "/api/stories",
+      "/api/stories/discover (POST) [SDE_006_4]",
+      "/api/stories/candidates (GET) [SDE_006_4]",
+      "/api/stories/:storyId (GET) [SDE_006_4]",
+      "/api/taxonomy/life-periods (GET) [NTG_006_4_3]",
+      "/api/taxonomy/contexts (GET) [NTG_006_4_3]",
+      "/api/taxonomy/roles (GET) [NTG_006_4_3]",
+      "/api/taxonomy/path (GET) [NTG_006_4_3]",
+      "/api/memories/:memoryId/editorial (GET,PUT) [MEI_006_2]",
+      "/api/memories/:memoryId/editorial/regenerate (POST) [MEI_006_2]",
+      "/api/memories/:memoryId/editorial/history (GET) [MEI_006_2]",
+      "/api/memories/:memoryId/affinity (GET) [MEI_006_2]",
       "/feed",
       "/api/feed (alias)",
       "/timeline",
       "/api/timeline (alias)",
       "/network",
       "/api/network",
+      "/messages/:conversationId/messages (POST JSON/multipart) [MESSAGE_ATTACHMENT_v1]",
+      "/messages/:conversationId/attachments/:attachmentId (GET privado) [MESSAGE_ATTACHMENT_v1]",
       "/profile (PUT) [legacy]",
       "/me/profile (GET,PUT) [PROFILE_v1]",
       "/api/me/profile (GET,PUT) [alias]",
@@ -132,6 +171,10 @@ app.get("/", (_req, res) => {
       "/api/memory/:id/photo (POST multipart) [alias]",
       "/authors/:id/profile (GET) [PROFILE_v1]",
       "/api/authors/:id/profile (GET) [alias]",
+      "/authors/:id/followers (GET) [AUTHOR_NETWORK_v1]",
+      "/api/authors/:id/followers (GET) [alias]",
+      "/authors/:id/following (GET) [AUTHOR_NETWORK_v1]",
+      "/api/authors/:id/following (GET) [alias]",
       "/cdn/avatars/:authorId/avatar (canônico, sem extensão)",
       "/cdn/memories/:authorId/:memoryId (canônico, sem extensão)",
       "/cdn/memory-media/:authorId/:memoryId/:mediaId/:variant (canônico imagem/áudio)",
@@ -163,12 +206,48 @@ app.get("/health", async (_req, res) => {
   }
 });
 
+app.use("/api/admin/auth", adminAuthRouter);
+console.log("[ROUTE] OK /api/admin/auth [ADMIN_AUTH_03]");
+
+app.use("/api/admin/probe", adminProbeRouter);
+console.log("[ROUTE] OK /api/admin/probe [ADMIN_AUTHZ_04]");
+
+app.use("/api/admin", adminUsersAccessRouter);
+console.log("[ROUTE] OK /api/admin/users + /api/admin/roles [ADMIN_USERS_ACCESS_05]");
+
+app.use("/api/admin", adminPlansRouter);
+console.log("[ROUTE] OK /api/admin/plans [ADMIN_PLANS_06_1]");
+
+app.use("/api/admin", adminAiLedgerRouter);
+console.log("[ROUTE] OK /api/admin/ai-ledger [ADMIN_AI_LEDGER_07A]");
+
+app.use("/api/admin", adminCampaignsRouter);
+console.log("[ROUTE] OK /api/admin/campaigns [ADMIN_CAMPAIGNS_09_02]");
+
+app.use("/api/admin", adminAdsRouter);
+console.log("[ROUTE] OK /api/admin/ads [ADMIN_ADS_10]");
+
+app.use("/api/admin", adminMetricsRouter);
+console.log("[ROUTE] OK /api/admin/metrics/overview [ADMIN_METRICS_12 + ADS_REPORTING_METRICS]");
+
+app.use("/api/campaigns", campaignsRouter);
+console.log("[ROUTE] OK /api/campaigns/active [CAMPAIGN_DELIVERY_09_04]");
+
+app.use("/api/ads", adsRouter);
+console.log("[ROUTE] OK /api/ads/active + /api/ads/impressions + /api/ads/clicks [ADS_RUNTIME_DELIVERY + ADS_DELIVERY_LEDGER + ADS_IMPRESSION_TRACKING + ADS_CLICK_TRACKING]");
+
 app.use("/auth", authRouter);
 app.use("/api/auth", authRouter);
 console.log("[ROUTE] OK /api/auth");
 
 app.use("/chapters", chaptersRouter);
 app.use("/api/chapters", chaptersRouter);
+app.use("/books", booksRouter);
+app.use("/api/books", booksRouter);
+
+console.log("[ROUTE] OK /books");
+console.log("[ROUTE] OK /api/books");
+
 app.use("/memory", memoryRouter);
 app.use("/api/memory", memoryRouter);
 
@@ -181,13 +260,35 @@ app.use("/api/memory", memoryRouter);
 app.use("/api/narrative", narrativeRoutes);
 console.log("[ROUTE] OK /api/narrative [AI Narrative Engine]");
 
+app.use("/api/taxonomy", taxonomyRouter);
+console.log("[ROUTE] OK /api/taxonomy/* [NTG_006_4_3]");
+
+app.use("/api", memoryEditorialRouter);
+console.log("[ROUTE] OK /api/memories/:memoryId/editorial [MEI_006_2]");
+
+// ========================================
+// GO LIVE 006.4 — Story Discovery Engine
+// Deve ser registrado antes das rotas amplas "/" e "/api".
+// ========================================
+app.use("/stories", storiesRouter);
+app.use("/api/stories", storiesRouter);
+console.log("[ROUTE] OK /stories [SDE_006_4]");
+console.log("[ROUTE] OK /api/stories [SDE_006_4]");
+
+app.use("/authors", authorsRouter);
+app.use("/api/authors", authorsRouter);
+console.log("[ROUTE] OK /authors");
+console.log("[ROUTE] OK /api/authors");
 app.use("/", memoriesRouter);
 app.use("/api", memoriesRouter);
-app.use("/authors", authorsRouter);
 app.use("/timeline", timelineRouter);
 app.use("/api/timeline", timelineRouter);
 app.use("/network", networkRouter);
 app.use("/api/network", networkRouter);
+app.use("/messages", messagesRouter);
+app.use("/api/messages", messagesRouter);
+app.use("/notifications", notificationsRouter);
+app.use("/api/notifications", notificationsRouter);
 app.use("/me", meRouter);
 app.use("/api/me", meRouter);
 app.use("/plans", plansRouter);
@@ -825,7 +926,17 @@ async function handleAuthorPublicProfile(req, res, next) {
           a.name_public,
           a.bio_short,
           a.location,
-          a.avatar_url
+          a.avatar_url,
+          followers = (
+            SELECT COUNT(1)
+            FROM dbo.identity_follow f
+            WHERE f.followed_id = a.author_id
+          ),
+          following = (
+            SELECT COUNT(1)
+            FROM dbo.identity_follow f
+            WHERE f.follower_id = a.author_id
+          )
         FROM dbo.identity_author a
         WHERE a.author_id = @author_id;
       `);
@@ -845,6 +956,8 @@ async function handleAuthorPublicProfile(req, res, next) {
       bio_short: row.bio_short != null ? String(row.bio_short) : null,
       location: row.location != null ? String(row.location) : null,
       avatar_url: row.avatar_url != null ? String(row.avatar_url) : null,
+      followers: Number(row.followers || 0),
+      following: Number(row.following || 0),
     });
   } catch (err) {
     return next(err);
@@ -1808,6 +1921,8 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({
     error: status >= 500 ? "Internal Server Error" : "Bad Request",
     detail: err?.message,
+    code: err?.code || null,
+    details: err?.details || null,
   });
 });
 

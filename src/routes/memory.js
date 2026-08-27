@@ -1,4 +1,4 @@
-﻿// C:\HDUD_DATA\hdud-api-node\src\routes\memory.js
+// C:\HDUD_DATA\hdud-api-node\src\routes\memory.js
 
 import express from "express";
 import fs from "fs";
@@ -18,8 +18,174 @@ import {
   createNarrativeEvent,
   buildEventKey,
 } from "../services/narrative-events.js";
+import {
+  refineMemoryWithOpenAI,
+  MEMORY_REFINER_PROMPT_VERSION,
+} from "../services/narrative/memory-refiner.service.js";
+import { regenerateEditorial, recalculateAffinity } from "../services/memory-editorial-intelligence.service.js";
+import {
+  getCurrentMemoryProvenance,
+  ensureMemoryVersionProvenance,
+} from "../services/memories/memory-provenance-segments.service.js";
+import {
+  checkPlanFeature,
+  sendPlanDenied,
+} from "../services/plan-enforcement.service.js";
 
 const router = express.Router();
+
+async function getLatestMemoryVersion(pool, memoryId) {
+  const r = await pool
+    .request()
+    .input("memory_id", sql.Int, Number(memoryId))
+    .query(`
+      SELECT TOP 1 version_id, version_number, title, content, created_at, created_by,
+             origin_code, source_proposal_id
+      FROM dbo.identity_memory_versions
+      WHERE memory_id = @memory_id
+      ORDER BY version_number DESC, version_id DESC;
+    `);
+  return r.recordset?.[0] || null;
+}
+
+async function createMemoryAIProposal({
+  pool,
+  memoryId,
+  authorId,
+  sourceVersion,
+  sourceTitle,
+  sourceContent,
+}) {
+  const r = await pool
+    .request()
+    .input("memory_id", sql.Int, Number(memoryId))
+    .input("author_id", sql.Int, Number(authorId))
+    .input("source_version_id", sql.Int, sourceVersion?.version_id ?? null)
+    .input("source_version_number", sql.Int, sourceVersion?.version_number ?? null)
+    .input("source_title", sql.NVarChar(500), sourceTitle || null)
+    .input("source_content", sql.NVarChar(sql.MAX), sourceContent)
+    .input("prompt_version", sql.VarChar(50), MEMORY_REFINER_PROMPT_VERSION)
+    .query(`
+      INSERT INTO dbo.identity_memory_ai_proposal
+      (
+        memory_id, author_id,
+        source_version_id, source_version_number,
+        source_title, source_content, source_content_hash,
+        prompt_version, proposal_status, created_at
+      )
+      OUTPUT INSERTED.proposal_id
+      VALUES
+      (
+        @memory_id, @author_id,
+        @source_version_id, @source_version_number,
+        @source_title, @source_content,
+        CONVERT(varchar(64), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @source_content)), 2),
+        @prompt_version, 'GENERATING', SYSUTCDATETIME()
+      );
+    `);
+  return Number(r.recordset?.[0]?.proposal_id) || null;
+}
+
+async function finalizeMemoryAIProposal({
+  pool,
+  proposalId,
+  aiResult,
+  proposedTitle,
+  proposedContent,
+}) {
+  const usageIds = Array.from(
+    new Set(
+      (Array.isArray(aiResult?.ai_usage_ids) ? aiResult.ai_usage_ids : [])
+        .map(Number)
+        .filter((v) => Number.isFinite(v) && v > 0)
+    )
+  );
+  const primaryAIUsageId =
+    Number(aiResult?.primary_ai_usage_id) ||
+    (usageIds.length ? usageIds[usageIds.length - 1] : null);
+
+  await pool
+    .request()
+    .input("proposal_id", sql.BigInt, Number(proposalId))
+    .input("primary_ai_usage_id", sql.BigInt, primaryAIUsageId)
+    .input("model", sql.VarChar(120), aiResult?.model || null)
+    .input("prompt_version", sql.VarChar(50), aiResult?.prompt_version || MEMORY_REFINER_PROMPT_VERSION)
+    .input("proposed_title", sql.NVarChar(500), proposedTitle || null)
+    .input("proposed_content", sql.NVarChar(sql.MAX), proposedContent)
+    .query(`
+      UPDATE dbo.identity_memory_ai_proposal
+      SET
+        primary_ai_usage_id = @primary_ai_usage_id,
+        provider = 'OPENAI',
+        model = @model,
+        prompt_version = @prompt_version,
+        proposed_title = @proposed_title,
+        proposed_content = @proposed_content,
+        proposed_content_hash =
+          CONVERT(varchar(64), HASHBYTES('SHA2_256', CONVERT(varbinary(max), @proposed_content)), 2),
+        proposal_status = 'PENDING',
+        generated_at = SYSUTCDATETIME(),
+        error_detail = NULL
+      WHERE proposal_id = @proposal_id;
+    `);
+
+  for (let index = 0; index < usageIds.length; index += 1) {
+    await pool
+      .request()
+      .input("proposal_id", sql.BigInt, Number(proposalId))
+      .input("ai_usage_id", sql.BigInt, usageIds[index])
+      .input("usage_order", sql.Int, index + 1)
+      .query(`
+        IF NOT EXISTS
+        (
+          SELECT 1
+          FROM dbo.identity_memory_ai_proposal_usage
+          WHERE proposal_id=@proposal_id AND ai_usage_id=@ai_usage_id
+        )
+        BEGIN
+          INSERT INTO dbo.identity_memory_ai_proposal_usage
+            (proposal_id, ai_usage_id, usage_order)
+          VALUES
+            (@proposal_id, @ai_usage_id, @usage_order);
+        END;
+      `);
+  }
+
+  return { usageIds, primaryAIUsageId };
+}
+
+async function failMemoryAIProposal(pool, proposalId, detail) {
+  if (!proposalId) return;
+  try {
+    await pool
+      .request()
+      .input("proposal_id", sql.BigInt, Number(proposalId))
+      .input("error_detail", sql.NVarChar(1000), String(detail || "Falha ao gerar proposta.").slice(0, 1000))
+      .query(`
+        UPDATE dbo.identity_memory_ai_proposal
+        SET proposal_status='FAILED',
+            error_detail=@error_detail,
+            generated_at=COALESCE(generated_at, SYSUTCDATETIME())
+        WHERE proposal_id=@proposal_id
+          AND proposal_status='GENERATING';
+      `);
+  } catch (err) {
+    console.warn("[MEMORY_PROVENANCE] falha ao marcar proposal FAILED:", err?.message || err);
+  }
+}
+
+async function classifyMemoryEditorialSafe({ memoryId, authorId, changedBy = null }) {
+  try {
+    const result = await regenerateEditorial({ memoryId, authorId, changedBy });
+    // upsertEditorial já recalcula afinidade; chamada explícita mantém o contrato
+    // resiliente caso a implementação interna mude no futuro.
+    await recalculateAffinity({ memoryId, authorId });
+    return { ok: true, result };
+  } catch (err) {
+    console.warn(`[MEI][memory ${memoryId}] classificação automática não bloqueou a memória:`, err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,7 +199,7 @@ try {
 const imageUpload = multer({
   dest: TMP_UPLOAD_DIR,
   limits: {
-    fileSize: 10 * 1024 * 1024,
+    fileSize: 50 * 1024 * 1024,
   },
   fileFilter: (_req, file, cb) => {
     const mime = String(file?.mimetype || "").trim().toLowerCase();
@@ -379,6 +545,83 @@ function inferImageExtensionFromUpload(file) {
   return "jpg";
 }
 
+
+function ensureParentDirSync(filePath) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function resolvePublicRelativeToAbsolute(relativePath) {
+  const safeRelative = String(relativePath || "").replace(/^[/\\]+/, "");
+  if (!safeRelative) return null;
+
+  const absolute = path.resolve(PUBLIC_DIR, safeRelative);
+  if (!absolute.startsWith(PUBLIC_DIR)) return null;
+
+  return absolute;
+}
+
+function normalizePublicCdnMemoryUrl(authorId, memoryId, variant = "original") {
+  return `/cdn/memories/${Number(authorId)}/${Number(memoryId)}?variant=${String(
+    variant || "original"
+  ).toLowerCase()}`;
+}
+
+function safeRemoveDirectorySync(dirPath) {
+  if (!dirPath) return;
+
+  try {
+    const absolute = path.resolve(dirPath);
+    if (!absolute.startsWith(PUBLIC_DIR)) return;
+    if (!fs.existsSync(absolute)) return;
+    fs.rmSync(absolute, { recursive: true, force: true });
+  } catch (err) {
+    console.warn("[memory/photo] Falha ao remover diretório antigo:", err?.message || err);
+  }
+}
+
+function imageMediaFolderFromStoragePath(storagePath) {
+  const absolute = resolvePublicRelativeToAbsolute(storagePath);
+  if (!absolute) return null;
+
+  // storage_path aponta para original.jpg; a pasta da mídia é o parent.
+  return path.dirname(absolute);
+}
+
+async function listOldImageMediaForCleanup(pool, memoryId, keepMediaId) {
+  const result = await pool
+    .request()
+    .input("memory_id", sql.Int, Number(memoryId))
+    .input("keep_media_id", sql.BigInt, Number(keepMediaId))
+    .query(`
+      SELECT
+        media_id,
+        storage_path
+      FROM dbo.identity_memory_media
+      WHERE memory_id = @memory_id
+        AND media_type = 'image'
+        AND media_id <> @keep_media_id;
+    `);
+
+  return result.recordset || [];
+}
+
+async function enforceSingleActiveImageMedia(pool, memoryId, keepMediaId) {
+  await pool
+    .request()
+    .input("memory_id", sql.Int, Number(memoryId))
+    .input("keep_media_id", sql.BigInt, Number(keepMediaId))
+    .query(`
+      UPDATE dbo.identity_memory_media
+      SET
+        is_primary_for_memory = CASE WHEN media_id = @keep_media_id THEN 1 ELSE 0 END,
+        is_deleted = CASE WHEN media_id = @keep_media_id THEN 0 ELSE 1 END,
+        updated_at = SYSUTCDATETIME()
+      WHERE memory_id = @memory_id
+        AND media_type = 'image';
+    `);
+}
+
 async function resolveUserIdAndCode(pool, req, authorId) {
   let userId = pickFirstInt(req.user, ["user_id", "userId", "id", "uid"]);
 
@@ -626,16 +869,6 @@ async function persistMediaStoragePath(pool, mediaId, storagePath) {
       WHERE media_id = @media_id
         AND ISNULL(storage_path, '') <> @storage_path;
     `);
-}
-
-async function validateAndReserveAudioUsage(pool, userId, audioSeconds) {
-  const result = await pool
-    .request()
-    .input("user_id", sql.BigInt, Number(userId))
-    .input("audio_seconds", sql.Int, Number(audioSeconds))
-    .execute("dbo.p_ValidateAndReserveAudioUsage");
-
-  return result?.recordset?.[0] || null;
 }
 
 async function ensureMemoryEditable(pool, memoryId) {
@@ -929,7 +1162,14 @@ router.post("/", authenticate, async (req, res) => {
       await updateMemoryPhotoUrl(pool, memoryId, photoUrlInput);
     }
 
-    const fresh = await selectMemoryById(pool, memoryId);
+    let fresh = await selectMemoryById(pool, memoryId);
+
+    await classifyMemoryEditorialSafe({
+      memoryId,
+      authorId,
+      changedBy: String(userCode || "hdud_api"),
+    });
+    fresh = await selectMemoryById(pool, memoryId);
 
     await emitNarrativeEventSafe({
       authorId,
@@ -1056,6 +1296,417 @@ router.get("/:id", authenticate, async (req, res) => {
   }
 });
 
+
+router.post(
+  "/:id/editorial-suggestion",
+  authenticate,
+  requireMemoryOwnership({ paramName: "id" }),
+  async (req, res) => {
+    try {
+      const memoryId = coercePositiveInt(req.params.id);
+      if (memoryId == null) {
+        return res.status(400).json({ error: "id inválido." });
+      }
+
+      const pool = await getPool();
+      const memory = await selectMemoryById(pool, memoryId);
+
+      if (!memory || memory.is_deleted) {
+        return res.status(404).json({ error: "Memória não encontrada." });
+      }
+
+      const authorId = coercePositiveInt(memory.author_id);
+      if (authorId == null) {
+        return res.status(500).json({ error: "Autor da memória inválido." });
+      }
+
+      if (!assertAuthorAccess(req, res, authorId)) return;
+
+      const { userId } = await resolveUserIdAndCode(pool, req, authorId);
+
+      const sourceTitle = normalizeTextInput(req.body?.title, 510);
+      const sourceContent = normalizeTextInput(req.body?.content);
+
+      const memoryForRefine = {
+        ...memory,
+        title: sourceTitle !== undefined ? sourceTitle : memory.title,
+        content: sourceContent !== undefined ? sourceContent : memory.content,
+        phase_code: memory.life_phase || memory.phase_code || null,
+      };
+
+      if (!normalizeTextInput(memoryForRefine.content)) {
+        return res.status(422).json({
+          error: "Conteúdo obrigatório para sugestão editorial.",
+        });
+      }
+
+      const sourceVersion = await getLatestMemoryVersion(pool, memoryId);
+      const proposalId = await createMemoryAIProposal({
+        pool,
+        memoryId,
+        authorId,
+        sourceVersion,
+        sourceTitle: memoryForRefine.title || null,
+        sourceContent: memoryForRefine.content || "",
+      });
+
+      if (!proposalId) {
+        return res.status(500).json({ error: "Não foi possível abrir a proposta editorial." });
+      }
+
+      let aiResult;
+      try {
+        aiResult = await refineMemoryWithOpenAI({
+          memory: memoryForRefine,
+          options: {
+            mode: "memory_editorial_suggestion",
+            preserve_voice: true,
+            intensity: Number(req.body?.intensity || 7),
+            language: req.body?.language || "pt-BR",
+          },
+          voiceProfile: null,
+          usageContext: {
+            userId,
+            authorId,
+            operationCode: "MEMORY_EDITORIAL_REFINE",
+            entityType: "MEMORY",
+            entityId: memoryId,
+            metadata: {
+              memory_id: memoryId,
+              proposal_id: proposalId,
+              prompt_version: MEMORY_REFINER_PROMPT_VERSION,
+            },
+          },
+        });
+      } catch (err) {
+        await failMemoryAIProposal(pool, proposalId, err?.message || err);
+        throw err;
+      }
+
+      if (!aiResult?.ok) {
+        await failMemoryAIProposal(pool, proposalId, aiResult?.reason);
+        return res.status(503).json({
+          error: "Não foi possível gerar sugestão editorial agora.",
+          detail: aiResult?.reason || "Serviço editorial indisponível.",
+          proposal_id: proposalId,
+        });
+      }
+
+      const proposedTitle =
+        aiResult.result?.refined_title || memoryForRefine.title || null;
+      const proposedContent =
+        aiResult.result?.refined_content || memoryForRefine.content || "";
+
+      const provenance = await finalizeMemoryAIProposal({
+        pool,
+        proposalId,
+        aiResult,
+        proposedTitle,
+        proposedContent,
+      });
+
+      return res.json({
+        ok: true,
+        memory_id: memoryId,
+        proposal_id: proposalId,
+        ai_usage_id: provenance.primaryAIUsageId,
+        ai_usage_ids: provenance.usageIds,
+        prompt_version: aiResult.prompt_version || MEMORY_REFINER_PROMPT_VERSION,
+        original: {
+          title: memoryForRefine.title || null,
+          content: memoryForRefine.content || "",
+        },
+        suggestion: {
+          title: proposedTitle,
+          content: proposedContent,
+        },
+        editorial: {
+          model: aiResult.model || null,
+          prompt_version: aiResult.prompt_version || MEMORY_REFINER_PROMPT_VERSION,
+          voice_preserved: aiResult.result?.voice_preserved !== false,
+          voice_profile_used: aiResult.result?.voice_profile_used === true,
+          emotional_intensity: aiResult.result?.emotional_intensity ?? null,
+          changes_summary: Array.isArray(aiResult.result?.changes_summary)
+            ? aiResult.result.changes_summary
+            : [],
+          source_policy:
+            aiResult.result?.source_policy ||
+            "Somente memória real do autor. Sem conteúdo inventado.",
+        },
+      });
+    } catch (err) {
+      console.error("[POST /memory/:id/editorial-suggestion] erro:", err);
+      return res.status(500).json({
+        error: "Erro ao gerar sugestão editorial.",
+        detail: extractSqlErrorDetail(err),
+      });
+    }
+  }
+);
+
+router.post(
+  "/:id/editorial-apply",
+  authenticate,
+  requireMemoryOwnership({ paramName: "id" }),
+  async (req, res) => {
+    try {
+      const memoryId = coercePositiveInt(req.params.id);
+      if (memoryId == null) {
+        return res.status(400).json({ error: "id inválido." });
+      }
+
+      const proposalId = coercePositiveInt(req.body?.proposal_id);
+      if (proposalId == null) {
+        return res.status(422).json({
+          error: "proposal_id é obrigatório para aplicar sugestão editorial.",
+        });
+      }
+
+      const pool = await getPool();
+      const mem = await ensureMemoryEditable(pool, memoryId);
+
+      if (!mem) {
+        return res.status(404).json({ error: "Memória não encontrada." });
+      }
+
+      const authorId = Number(mem.author_id);
+      if (!assertAuthorAccess(req, res, authorId)) return;
+
+      const { userId, userCode } = await resolveUserIdAndCode(pool, req, authorId);
+      if (!userId) {
+        return res.status(401).json({ error: "userId não encontrado no token." });
+      }
+
+      const transaction = new sql.Transaction(pool);
+      await transaction.begin();
+
+      let updated = null;
+      let acceptedVersion = null;
+      let proposal = null;
+      let versionOriginCode = null;
+      let acceptanceMode = null;
+
+      try {
+        const proposalResult = await new sql.Request(transaction)
+          .input("proposal_id", sql.BigInt, Number(proposalId))
+          .input("memory_id", sql.Int, memoryId)
+          .input("author_id", sql.Int, authorId)
+          .query(`
+            SELECT TOP 1 *
+            FROM dbo.identity_memory_ai_proposal WITH (UPDLOCK, HOLDLOCK)
+            WHERE proposal_id=@proposal_id
+              AND memory_id=@memory_id
+              AND author_id=@author_id;
+          `);
+
+        proposal = proposalResult.recordset?.[0] || null;
+
+        if (!proposal) {
+          await transaction.rollback();
+          return res.status(404).json({ error: "Proposta editorial não encontrada." });
+        }
+
+        if (String(proposal.proposal_status).toUpperCase() !== "PENDING") {
+          await transaction.rollback();
+          return res.status(409).json({
+            error: "Proposta editorial já decidida ou indisponível.",
+            proposal_status: proposal.proposal_status,
+          });
+        }
+
+        const proposedContent = normalizeTextInput(proposal.proposed_content);
+        if (!proposedContent) {
+          await transaction.rollback();
+          return res.status(422).json({ error: "Proposta editorial sem conteúdo persistido." });
+        }
+
+        const acceptedContent =
+          normalizeTextInput(req.body?.content) || proposedContent;
+
+        const proposedTitle =
+          normalizeTextInput(proposal.proposed_title, 510) ??
+          (mem.title != null ? String(mem.title).slice(0, 510) : null);
+
+        const acceptedTitle =
+          normalizeTextInput(req.body?.title, 510) ?? proposedTitle;
+
+        const authorModifiedProposal =
+          acceptedContent !== proposedContent ||
+          String(acceptedTitle || "") !== String(proposedTitle || "");
+
+        versionOriginCode = authorModifiedProposal
+          ? "AUTHOR_EDIT"
+          : "AI_ACCEPTED";
+
+        acceptanceMode = authorModifiedProposal
+          ? "AUTHOR_MODIFIED"
+          : "EXACT";
+
+        const newContent = acceptedContent;
+        const titleToPersist = acceptedTitle;
+
+        const result = await new sql.Request(transaction)
+          .input("MemoryId", sql.Int, memoryId)
+          .input("NewTitle", sql.NVarChar(510), titleToPersist)
+          .input("NewContent", sql.NVarChar(sql.MAX), newContent)
+          .input("UserId", sql.Int, Number(userId))
+          .input("AuthorId", sql.Int, authorId)
+          .input("UserCode", sql.NVarChar(200), String(userCode).slice(0, 200))
+          .execute("dbo.p_UpdateMemory_WithVersion");
+
+        updated = result?.recordset?.[0] || null;
+
+        const versionResult = await new sql.Request(transaction)
+          .input("memory_id", sql.Int, memoryId)
+          .input("proposal_id", sql.BigInt, Number(proposalId))
+          .query(`
+            SELECT TOP 1 version_id, version_number
+            FROM dbo.identity_memory_versions
+            WHERE memory_id=@memory_id
+            ORDER BY version_number DESC, version_id DESC;
+          `);
+
+        acceptedVersion = versionResult.recordset?.[0] || null;
+        if (!acceptedVersion?.version_id) {
+          throw new Error("Versão aceita não foi localizada após atualização.");
+        }
+
+        await new sql.Request(transaction)
+          .input("VersionId", sql.Int, Number(acceptedVersion.version_id))
+          .input("ProposalId", sql.BigInt, Number(proposalId))
+          .input("OriginCode", sql.VarChar(32), versionOriginCode)
+          .input("UserId", sql.Int, Number(userId))
+          .input("AuthorId", sql.Int, authorId)
+          .input("AcceptedTitle", sql.NVarChar(500), acceptedTitle || null)
+          .input("AcceptedContent", sql.NVarChar(sql.MAX), acceptedContent)
+          .input("AcceptanceMode", sql.VarChar(24), acceptanceMode)
+          .execute("dbo.p_SetMemoryVersionProvenance");
+
+        await transaction.commit();
+      } catch (txErr) {
+        try {
+          if (transaction._aborted !== true) await transaction.rollback();
+        } catch {}
+        throw txErr;
+      }
+
+      // Persistência granular é idempotente e também possui backfill no GET /provenance.
+      // Se houver falha operacional aqui, não invalidamos o aceite já commitado.
+      try {
+        if (acceptedVersion?.version_id) {
+          await ensureMemoryVersionProvenance(pool, Number(acceptedVersion.version_id));
+        }
+      } catch (provenanceErr) {
+        console.error("[memory provenance] falha ao persistir versão aceita:", provenanceErr);
+      }
+
+      const fresh = await selectMemoryById(pool, memoryId);
+
+      return res.json({
+        ok: true,
+        memory_id: memoryId,
+        proposal_id: proposalId,
+        ai_usage_id: proposal?.primary_ai_usage_id || null,
+        accepted_version_id: acceptedVersion?.version_id || null,
+        accepted_version_number: acceptedVersion?.version_number || null,
+        origin_code: versionOriginCode,
+        acceptance_mode: acceptanceMode,
+        applied: true,
+        versioned: true,
+        source: "memory_editorial_suggestion",
+        memory: attachMeta(fresh || updated || { ok: true, memory_id: memoryId }, req, authorId),
+      });
+    } catch (err) {
+      console.error("[POST /memory/:id/editorial-apply] erro:", err);
+      return res.status(500).json({
+        error: "Erro ao aplicar sugestão editorial.",
+        detail: extractSqlErrorDetail(err),
+      });
+    }
+  }
+);
+
+router.post(
+  "/:id/editorial-reject",
+  authenticate,
+  requireMemoryOwnership({ paramName: "id" }),
+  async (req, res) => {
+    try {
+      const memoryId = coercePositiveInt(req.params.id);
+      const proposalId = coercePositiveInt(req.body?.proposal_id);
+
+      if (memoryId == null || proposalId == null) {
+        return res.status(400).json({ error: "memory_id/proposal_id inválido." });
+      }
+
+      const pool = await getPool();
+      const mem = await ensureMemoryEditable(pool, memoryId);
+      if (!mem) return res.status(404).json({ error: "Memória não encontrada." });
+
+      const authorId = Number(mem.author_id);
+      if (!assertAuthorAccess(req, res, authorId)) return;
+
+      const { userId } = await resolveUserIdAndCode(pool, req, authorId);
+
+      const result = await pool
+        .request()
+        .input("proposal_id", sql.BigInt, Number(proposalId))
+        .input("memory_id", sql.Int, memoryId)
+        .input("author_id", sql.Int, authorId)
+        .input("user_id", sql.Int, Number(userId))
+        .query(`
+          UPDATE dbo.identity_memory_ai_proposal
+          SET proposal_status='REJECTED',
+              decided_at=SYSUTCDATETIME(),
+              decided_by_user_id=@user_id,
+              decided_by_author_id=@author_id
+          OUTPUT INSERTED.proposal_id, INSERTED.proposal_status, INSERTED.decided_at
+          WHERE proposal_id=@proposal_id
+            AND memory_id=@memory_id
+            AND author_id=@author_id
+            AND proposal_status='PENDING';
+        `);
+
+      const rejected = result.recordset?.[0] || null;
+      if (!rejected) {
+        const current = await pool
+          .request()
+          .input("proposal_id", sql.BigInt, Number(proposalId))
+          .input("memory_id", sql.Int, memoryId)
+          .query(`
+            SELECT TOP 1 proposal_status
+            FROM dbo.identity_memory_ai_proposal
+            WHERE proposal_id=@proposal_id AND memory_id=@memory_id;
+          `);
+
+        if (!current.recordset?.[0]) {
+          return res.status(404).json({ error: "Proposta editorial não encontrada." });
+        }
+
+        return res.status(409).json({
+          error: "Proposta editorial já decidida ou indisponível.",
+          proposal_status: current.recordset[0].proposal_status,
+        });
+      }
+
+      return res.json({
+        ok: true,
+        memory_id: memoryId,
+        proposal_id: Number(rejected.proposal_id),
+        proposal_status: rejected.proposal_status,
+        decided_at: rejected.decided_at,
+        memory_unchanged: true,
+      });
+    } catch (err) {
+      console.error("[POST /memory/:id/editorial-reject] erro:", err);
+      return res.status(500).json({
+        error: "Erro ao rejeitar sugestão editorial.",
+        detail: extractSqlErrorDetail(err),
+      });
+    }
+  }
+);
+
 router.put(
   "/:id",
   authenticate,
@@ -1116,6 +1767,18 @@ router.put(
         .execute("dbo.p_UpdateMemory_WithVersion");
 
       const updated = result?.recordset?.[0] || null;
+
+      // Edição manual: a procedure cria nova versão; o trigger a classifica
+      // como AUTHOR_EDIT e aqui persistimos a granularidade herdando a
+      // proveniência da versão anterior.
+      try {
+        const latestAfterAuthorEdit = await getLatestMemoryVersion(pool, memoryId);
+        if (latestAfterAuthorEdit?.version_id) {
+          await ensureMemoryVersionProvenance(pool, Number(latestAfterAuthorEdit.version_id));
+        }
+      } catch (provenanceErr) {
+        console.error("[memory provenance] falha ao persistir edição autoral:", provenanceErr);
+      }
 
       if (phaseIdDirectRaw !== undefined) {
         if (phaseIdDirectRaw === null) {
@@ -1179,6 +1842,30 @@ router.put(
       console.error("[PUT /memory/:id] erro:", err);
       return res.status(500).json({
         error: "Erro ao atualizar memória.",
+        detail: extractSqlErrorDetail(err),
+      });
+    }
+  }
+);
+
+router.get(
+  "/:id/provenance",
+  authenticate,
+  requireMemoryOwnership({ paramName: "id" }),
+  async (req, res) => {
+    try {
+      const memoryId = parseInt(req.params.id, 10);
+      if (!Number.isInteger(memoryId) || memoryId <= 0) {
+        return res.status(400).json({ error: "id inválido." });
+      }
+      const pool = await getPool();
+      const provenance = await getCurrentMemoryProvenance(pool, memoryId);
+      if (!provenance) return res.status(404).json({ error: "Memória/versão não encontrada." });
+      return res.json({ ok: true, ...provenance });
+    } catch (err) {
+      console.error("[GET /memory/:id/provenance] erro:", err);
+      return res.status(500).json({
+        error: "Erro ao carregar proveniência da memória.",
         detail: extractSqlErrorDetail(err),
       });
     }
@@ -1516,6 +2203,34 @@ router.post(
         return;
       }
 
+      const { userId } = await resolveUserIdAndCode(pool, req, authorId);
+      if (userId == null || Number.isNaN(Number(userId))) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {}
+        return res.status(401).json({
+          ok: false,
+          error: "userId não encontrado no token.",
+        });
+      }
+
+      const uploadCheck = await checkPlanFeature({
+        pool,
+        userId,
+        featureCode: "UPLOAD_MAX_BYTES",
+        requestedValue: Number(req.file.size || 0),
+      });
+
+      if (!uploadCheck.allowed) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {}
+        return sendPlanDenied(res, uploadCheck, {
+          status: 413,
+          message: "O arquivo excede o limite de upload do seu plano.",
+        });
+      }
+
       const uploadExt = inferImageExtensionFromUpload(req.file);
       const pendingStoragePath = buildImagePendingStoragePath(
         authorId,
@@ -1568,7 +2283,7 @@ router.post(
             @original_file_name,
             @mime_type,
             @file_size_bytes,
-            1,
+            0,
             0,
             SYSUTCDATETIME(),
             SYSUTCDATETIME()
@@ -1590,22 +2305,42 @@ router.post(
         mediaId,
         uploadExt
       );
+      const finalAbsolutePath = resolvePublicRelativeToAbsolute(finalStoragePath);
+
+      if (!finalAbsolutePath) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {}
+        return res.status(500).json({ error: "storage_path final da imagem inválido." });
+      }
+
+      ensureParentDirSync(finalAbsolutePath);
+      fs.copyFileSync(req.file.path, finalAbsolutePath);
+
+      if (!fs.existsSync(finalAbsolutePath)) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {}
+        return res.status(500).json({ error: "Falha ao persistir imagem no storage final." });
+      }
 
       await persistMediaStoragePath(pool, mediaId, finalStoragePath);
 
-      await pool
-        .request()
-        .input("memory_id", sql.Int, memoryId)
-        .input("media_id", sql.Int, mediaId)
-        .query(`
-          UPDATE dbo.identity_memory_media
-          SET
-            is_primary_for_memory = CASE WHEN media_id = @media_id THEN 1 ELSE 0 END,
-            updated_at = SYSUTCDATETIME()
-          WHERE memory_id = @memory_id
-            AND media_type = 'image'
-            AND ISNULL(is_deleted, 0) = 0;
-        `);
+      const oldImageMedia = await listOldImageMediaForCleanup(pool, memoryId, mediaId);
+      await enforceSingleActiveImageMedia(pool, memoryId, mediaId);
+
+      const canonicalPhotoUrl = normalizePublicCdnMemoryUrl(authorId, memoryId, "original");
+      await updateMemoryPhotoUrl(pool, memoryId, canonicalPhotoUrl);
+
+      // Regra de produto HDUD: 1 memória = 1 mídia de imagem ativa.
+      // Histórico editorial permanece em versões/diff/rollback; imagem antiga vira lixo operacional.
+      for (const oldMedia of oldImageMedia) {
+        const oldDir = imageMediaFolderFromStoragePath(oldMedia?.storage_path);
+        const finalDir = path.dirname(finalAbsolutePath);
+        if (oldDir && path.resolve(oldDir) !== path.resolve(finalDir)) {
+          safeRemoveDirectorySync(oldDir);
+        }
+      }
 
       const job = await enqueueMemoryImageProcessingJob({
         memoryId,
@@ -1656,7 +2391,7 @@ router.post(
         processing_status: "pending",
         storage_path: finalStoragePath,
         cdn: {
-          canonical_memory_url: `/cdn/memories/${authorId}/${memoryId}?variant=feed`,
+          canonical_memory_url: canonicalPhotoUrl,
           canonical_media_url: `/cdn/memory-media/${authorId}/${memoryId}/${mediaId}/feed`,
         },
       });
@@ -1679,7 +2414,7 @@ router.post(
       if (isMulterFileSize) {
         return res.status(413).json({
           error: "Arquivo muito grande.",
-          detail: "O limite atual para imagem é de 10MB.",
+          detail: "O arquivo excede o teto técnico de 50MB.",
         });
       }
 
@@ -1800,6 +2535,8 @@ router.post(
       const authorId = Number(mem.author_id);
       if (!assertAuthorAccess(req, res, authorId)) return;
 
+      const { userId } = await resolveUserIdAndCode(pool, req, authorId);
+
       const media = await selectMemoryMediaById(pool, memoryId, mediaId);
       if (!media || String(media.media_type).toLowerCase() !== "audio") {
         return res.status(404).json({ error: "Áudio não encontrado." });
@@ -1878,7 +2615,6 @@ router.post(
         });
       }
 
-      const { userId } = await resolveUserIdAndCode(pool, req, authorId);
       if (userId == null || Number.isNaN(Number(userId))) {
         return res.status(401).json({
           ok: false,
@@ -1951,47 +2687,32 @@ router.post(
         await persistMediaDurationSeconds(pool, mediaId, Number(audioSeconds));
       }
 
-      let usage = {
-        ok: true,
-        plan_code: processingProfile.planCode || null,
-        remaining_seconds: null,
-      };
-
-      if (!isInternalProcessing) {
-        usage = await validateAndReserveAudioUsage(pool, userId, audioSeconds);
-
-        if (!usage?.ok) {
-          return res.status(403).json({
-            ok: false,
-            error: {
-              code: usage?.error_code || "PLAN_USAGE_BLOCKED",
-              message:
-                usage?.error_code === "PLAN_AUDIO_LIMIT_EXCEEDED"
-                  ? "Seu plano atual permite um áudio menor do que o enviado."
-                  : usage?.error_code === "PLAN_MONTHLY_LIMIT_EXCEEDED"
-                    ? "Você atingiu o limite mensal do seu plano."
-                    : "Seu plano não permite processar este áudio agora.",
-              details: {
-                plan_code: usage?.plan_code ?? processingProfile.planCode ?? null,
-                max_audio_seconds: usage?.max_audio_seconds ?? null,
-                monthly_seconds: usage?.monthly_seconds ?? null,
-                remaining_seconds: usage?.remaining_seconds ?? null,
-                audio_duration_seconds: audioSeconds,
-              },
-            },
-          });
-        }
-      }
-
-      const job = await enqueueMemoryAudioTranscriptionJob({
-        memoryId,
-        mediaId,
-        authorId,
+      const transcriptionCheck = await checkPlanFeature({
+        pool,
         userId,
-        audioSeconds,
-        planCode: usage?.plan_code ?? processingProfile.planCode ?? null,
+        featureCode: "AUDIO_TRANSCRIPTION_SECONDS",
+        requestedValue: Number(audioSeconds || 0),
       });
 
+      if (!transcriptionCheck.allowed) {
+        return sendPlanDenied(res, transcriptionCheck, {
+          status: 403,
+          message: "A franquia mensal de áudio/transcrição foi atingida.",
+        });
+      }
+
+      // A rota faz o CHECK econômico antes do enqueue.
+      // A reserva/consumo definitivo do áudio continua pertencendo ao worker,
+      // preservando o fluxo assíncrono e a contabilização homologada.
+      //
+      // Regra editorial de retranscrição:
+      // - tentativa ainda não validada/refinada/aprovada é descartável;
+      // Retranscrever = nova tentativa editorial.
+      // A memória já aplicada/versionada NÃO é revertida e o histórico em
+      // identity_memory_media_revision permanece preservado. Somente o estado
+      // corrente do wizard é reiniciado antes do enqueue.
+      //
+      // Fazemos isso ANTES do enqueue para evitar condição de corrida com worker rápido.
       await pool
         .request()
         .input("media_id", sql.BigInt, mediaId)
@@ -2001,14 +2722,51 @@ router.post(
           sql.VarChar(50),
           isInternalProcessing ? "internal_queue" : "openai_queue"
         )
-        .input("stt_job_id", sql.NVarChar(120), String(job.id))
         .query(`
           UPDATE dbo.identity_memory_media
           SET
             transcription_status = @transcription_status,
             stt_provider = @stt_provider,
-            stt_job_id = @stt_job_id,
+            stt_job_id = NULL,
+            transcription_raw = NULL,
+            transcription_validated = NULL,
+            transcription_refined = NULL,
             updated_at = SYSUTCDATETIME()
+          WHERE media_id = @media_id;
+        `);
+
+      let job;
+      try {
+        job = await enqueueMemoryAudioTranscriptionJob({
+          memoryId,
+          mediaId,
+          authorId,
+          userId,
+          audioSeconds,
+          planCode: processingProfile.planCode || null,
+        });
+      } catch (queueErr) {
+        await pool
+          .request()
+          .input("media_id", sql.BigInt, mediaId)
+          .query(`
+            UPDATE dbo.identity_memory_media
+            SET transcription_status = 'failed',
+                updated_at = SYSUTCDATETIME()
+            WHERE media_id = @media_id;
+          `)
+          .catch(() => {});
+        throw queueErr;
+      }
+
+      await pool
+        .request()
+        .input("media_id", sql.BigInt, mediaId)
+        .input("stt_job_id", sql.NVarChar(120), String(job.id))
+        .query(`
+          UPDATE dbo.identity_memory_media
+          SET stt_job_id = @stt_job_id,
+              updated_at = SYSUTCDATETIME()
           WHERE media_id = @media_id;
         `);
 
@@ -2165,6 +2923,8 @@ router.post(
       const authorId = Number(mem.author_id);
       if (!assertAuthorAccess(req, res, authorId)) return;
 
+      const { userId } = await resolveUserIdAndCode(pool, req, authorId);
+
       const media = await selectMemoryMediaById(pool, memoryId, mediaId);
       if (!media || String(media.media_type).toLowerCase() !== "audio") {
         return res.status(404).json({ error: "Áudio não encontrado." });
@@ -2182,7 +2942,42 @@ router.post(
         });
       }
 
-      const refinedText = editorialRefineText(sourceText);
+      const aiResult = await refineMemoryWithOpenAI({
+        memory: {
+          ...mem,
+          memory_id: memoryId,
+          author_id: authorId,
+          title: mem.title || null,
+          content: sourceText,
+          phase_code: mem.life_phase || mem.phase_code || null,
+        },
+        options: {
+          mode: "memory_audio_editorial_refine",
+          preserve_voice: true,
+          intensity: Number(req.body?.intensity || 7),
+          language: req.body?.language || "pt-BR",
+        },
+        voiceProfile: null,
+        usageContext: {
+          userId,
+          authorId,
+          operationCode: "AUDIO_EDITORIAL_REFINE",
+          entityType: "MEMORY_MEDIA",
+          entityId: mediaId,
+          metadata: { memory_id: memoryId },
+        },
+      });
+
+      if (!aiResult?.ok || !normalizeTextInput(aiResult?.result?.refined_content)) {
+        return res.status(503).json({
+          error: "Não foi possível gerar o refino editorial agora.",
+          detail:
+            aiResult?.reason ||
+            "O motor editorial não retornou um texto refinado válido.",
+        });
+      }
+
+      const refinedText = String(aiResult.result.refined_content).trim();
 
       await pool
         .request()
@@ -2358,6 +3153,12 @@ router.post(
           transcription_status: "approved",
           apply_mode: mode,
         },
+      });
+
+      await classifyMemoryEditorialSafe({
+        memoryId,
+        authorId,
+        changedBy: String(userCode || "hdud_api"),
       });
 
       const freshMemory = await selectMemoryById(pool, memoryId);

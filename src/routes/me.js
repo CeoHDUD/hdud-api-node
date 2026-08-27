@@ -3,6 +3,7 @@
 import express from "express";
 import { authenticate } from "../middleware/auth.js";
 import { getPool, sql } from "../db.js";
+import { getAIUsageSummary } from "../services/ai-cost-usage.service.js";
 
 const router = express.Router();
 
@@ -28,14 +29,74 @@ function resolveUserId(req) {
   return null;
 }
 
+function daysInUtcMonth(year, monthIndex) {
+  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+}
+
+function addMonthsUtcClamped(dateInput, months = 1) {
+  const source = new Date(dateInput);
+  if (Number.isNaN(source.getTime())) return null;
+
+  const targetMonthIndex = source.getUTCMonth() + Number(months || 0);
+  const targetYear = source.getUTCFullYear() + Math.floor(targetMonthIndex / 12);
+  const normalizedMonth = ((targetMonthIndex % 12) + 12) % 12;
+  const targetDay = Math.min(
+    source.getUTCDate(),
+    daysInUtcMonth(targetYear, normalizedMonth)
+  );
+
+  return new Date(
+    Date.UTC(
+      targetYear,
+      normalizedMonth,
+      targetDay,
+      source.getUTCHours(),
+      source.getUTCMinutes(),
+      source.getUTCSeconds(),
+      source.getUTCMilliseconds()
+    )
+  );
+}
+
 function addOneMonthUtc(dateInput) {
-  const d = new Date(dateInput);
-  if (Number.isNaN(d.getTime())) return null;
+  return addMonthsUtcClamped(dateInput, 1);
+}
 
-  const out = new Date(d.getTime());
-  out.setUTCMonth(out.getUTCMonth() + 1);
+function resolveCurrentBillingCycle(startsAt, nowInput = new Date()) {
+  const anchor = new Date(startsAt);
+  const now = new Date(nowInput);
 
-  return out;
+  if (Number.isNaN(anchor.getTime()) || Number.isNaN(now.getTime())) {
+    return { start: null, end: null };
+  }
+
+  if (now.getTime() < anchor.getTime()) {
+    return {
+      start: anchor,
+      end: addMonthsUtcClamped(anchor, 1),
+    };
+  }
+
+  let monthOffset =
+    (now.getUTCFullYear() - anchor.getUTCFullYear()) * 12 +
+    (now.getUTCMonth() - anchor.getUTCMonth());
+
+  let start = addMonthsUtcClamped(anchor, monthOffset) || anchor;
+
+  if (start.getTime() > now.getTime()) {
+    monthOffset -= 1;
+    start = addMonthsUtcClamped(anchor, monthOffset) || anchor;
+  }
+
+  let end = addMonthsUtcClamped(anchor, monthOffset + 1);
+
+  while (end && end.getTime() <= now.getTime()) {
+    monthOffset += 1;
+    start = end;
+    end = addMonthsUtcClamped(anchor, monthOffset + 1);
+  }
+
+  return { start, end };
 }
 
 function toIsoOrNull(value) {
@@ -168,16 +229,25 @@ async function getUsageFromProcedure(pool, userId) {
     .input("user_id", sql.BigInt, Number(userId))
     .execute("dbo.p_GetMyUsage");
 
-  return result?.recordset?.[0] || null;
+  return {
+    usageRow: result?.recordsets?.[0]?.[0] || result?.recordset?.[0] || null,
+    featureRows: Array.isArray(result?.recordsets?.[1]) ? result.recordsets[1] : [],
+  };
 }
 
 async function getUsageSafe(pool, userId, planRow = null) {
   try {
-    const usageRow = await getUsageFromProcedure(pool, userId);
-    return usageRow || buildUsageFallback(planRow);
+    const bundle = await getUsageFromProcedure(pool, userId);
+    return {
+      usageRow: bundle?.usageRow || buildUsageFallback(planRow),
+      featureRows: bundle?.featureRows || [],
+    };
   } catch (err) {
     console.error("[GET_USAGE_SAFE] erro ao executar dbo.p_GetMyUsage:", err);
-    return buildUsageFallback(planRow);
+    return {
+      usageRow: buildUsageFallback(planRow),
+      featureRows: [],
+    };
   }
 }
 
@@ -216,7 +286,7 @@ async function getPendingSubscriptionChange(pool, userId) {
   return result?.recordset?.[0] || null;
 }
 
-function buildUsageResponse(planRow, usageRow) {
+function buildUsageResponse(planRow, usageRow, featureRows = []) {
   const maxAudioSeconds =
     planRow?.max_audio_seconds != null
       ? safeNumber(planRow.max_audio_seconds)
@@ -257,6 +327,23 @@ function buildUsageResponse(planRow, usageRow) {
       remaining_seconds: remainingSeconds,
       audio_count: Math.max(0, safeNumber(usageRow?.audio_count || 0)),
     },
+    features: (featureRows || []).map((row) => ({
+      code: row.feature_code ? String(row.feature_code) : null,
+      name: row.feature_name ? String(row.feature_name) : null,
+      enforcement_mode: row.enforcement_mode ? String(row.enforcement_mode) : null,
+      value_type: row.value_type ? String(row.value_type) : null,
+      unit_code: row.unit_code ? String(row.unit_code) : null,
+      reset_policy: row.reset_policy ? String(row.reset_policy) : null,
+      bool_value: row.bool_value == null ? null : !!row.bool_value,
+      int_value: row.int_value == null ? null : Number(row.int_value),
+      string_value: row.string_value == null ? null : String(row.string_value),
+      consumed_value:
+        row.consumed_value == null ? null : Number(row.consumed_value),
+      reserved_value:
+        row.reserved_value == null ? null : Number(row.reserved_value),
+      remaining_value:
+        row.remaining_value == null ? null : Number(row.remaining_value),
+    })),
   };
 }
 
@@ -266,8 +353,11 @@ function buildSubscriptionPayload(activeSubscription, pendingChange) {
   }
 
   const startsAt = activeSubscription?.starts_at || null;
-  const currentPeriodStart = toIsoOrNull(startsAt);
-  const currentPeriodEnd = toIsoOrNull(addOneMonthUtc(startsAt));
+  const currentCycle = startsAt
+    ? resolveCurrentBillingCycle(startsAt)
+    : { start: null, end: null };
+  const currentPeriodStart = toIsoOrNull(currentCycle.start);
+  const currentPeriodEnd = toIsoOrNull(currentCycle.end);
 
   let status = activeSubscription ? "ACTIVE" : "CANCELLED";
   let statusLabel = "Ativa";
@@ -300,7 +390,22 @@ function buildSubscriptionPayload(activeSubscription, pendingChange) {
       next_plan_name: pendingChange.target_plan_name
         ? String(pendingChange.target_plan_name)
         : null,
-      effective_at: toIsoOrNull(pendingChange.effective_at),
+      effective_at: (() => {
+        const persistedEffectiveAt = pendingChange.effective_at
+          ? new Date(pendingChange.effective_at)
+          : null;
+        const now = new Date();
+
+        if (
+          persistedEffectiveAt &&
+          !Number.isNaN(persistedEffectiveAt.getTime()) &&
+          persistedEffectiveAt.getTime() > now.getTime()
+        ) {
+          return persistedEffectiveAt.toISOString();
+        }
+
+        return currentPeriodEnd;
+      })(),
       requested_at: toIsoOrNull(pendingChange.requested_at),
       applied_at: toIsoOrNull(pendingChange.applied_at),
       cancelled_at: toIsoOrNull(pendingChange.cancelled_at),
@@ -397,19 +502,88 @@ router.get("/usage", authenticate, async (req, res) => {
 
     const pool = await getPool();
     const planRow = await getActivePlan(pool, userId);
-    const usageRow = await getUsageSafe(pool, userId, planRow);
+    const usageBundle = await getUsageSafe(pool, userId, planRow);
+    const usageRow = usageBundle?.usageRow || null;
+    const featureRows = usageBundle?.featureRows || [];
 
     if (!planRow && !usageRow) {
       return res.status(404).json({ error: "Uso do plano não encontrado." });
     }
 
-    return res.json(buildUsageResponse(planRow, usageRow));
+    return res.json(buildUsageResponse(planRow, usageRow, featureRows));
   } catch (err) {
     console.error("[GET /me/usage] erro:", err);
     return res.status(500).json({
       error: "Erro ao carregar uso do plano.",
       detail: err?.message || null,
     });
+  }
+});
+
+router.get("/contract", authenticate, async (req, res) => {
+  try {
+    const userId = resolveUserId(req);
+    if (userId == null) {
+      return res.status(401).json({ error: "userId não encontrado no token." });
+    }
+
+    const pool = await getPool();
+    const result = await pool
+      .request()
+      .input("user_id", sql.BigInt, Number(userId))
+      .execute("dbo.p_GetMyPlanContract");
+
+    const rows = result?.recordset || [];
+    const first = rows[0] || null;
+
+    return res.json({
+      ok: true,
+      plan: first
+        ? {
+            plan_id: Number(first.plan_id),
+            code: String(first.plan_code || ""),
+            name: String(first.plan_name || ""),
+            price_cents: Number(first.price_cents || 0),
+            currency_code: String(first.currency_code || "BRL"),
+          }
+        : null,
+      features: rows.map((row) => ({
+        code: String(row.feature_code || ""),
+        name: String(row.feature_name || ""),
+        value_type: String(row.value_type || ""),
+        unit_code: row.unit_code == null ? null : String(row.unit_code),
+        reset_policy: String(row.reset_policy || ""),
+        enforcement_mode: String(row.enforcement_mode || ""),
+        ledger_operation_code:
+          row.ledger_operation_code == null
+            ? null
+            : String(row.ledger_operation_code),
+        bool_value: row.bool_value == null ? null : !!row.bool_value,
+        int_value: row.int_value == null ? null : Number(row.int_value),
+        string_value: row.string_value == null ? null : String(row.string_value),
+      })),
+    });
+  } catch (err) {
+    console.error("[GET /me/contract] erro:", err);
+    return res.status(500).json({
+      error: "Erro ao carregar contrato funcional do plano.",
+      detail: err?.message || null,
+    });
+  }
+});
+
+router.get("/ai-usage", authenticate, async (req, res) => {
+  try {
+    const userId = resolveUserId(req);
+    if (userId == null) {
+      return res.status(401).json({ error: "userId não encontrado no token." });
+    }
+    const pool = await getPool();
+    const aiUsage = await getAIUsageSummary({ pool, userId, limit: req.query?.limit });
+    return res.json({ ok: true, ...aiUsage });
+  } catch (err) {
+    console.error("[GET /me/ai-usage] erro:", err);
+    return res.status(500).json({ error: "Erro ao carregar consumo de IA externa.", detail: err?.message || null });
   }
 });
 
@@ -617,7 +791,9 @@ router.post("/subscription/change", authenticate, async (req, res) => {
       });
     }
 
-    const effectiveAt = addOneMonthUtc(currentSubscription.starts_at);
+    const effectiveAt = resolveCurrentBillingCycle(
+      currentSubscription.starts_at
+    ).end;
 
     if (!effectiveAt) {
       return res.status(500).json({

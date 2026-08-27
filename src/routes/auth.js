@@ -18,6 +18,11 @@ import {
 const router = Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || "hdud_dev_secret";
+const CORPORATE_OPERATOR_DOMAIN = "@hdud.ai";
+
+function isCorporateOperatorEmail(email) {
+  return String(email || "").trim().toLowerCase().endsWith(CORPORATE_OPERATOR_DOMAIN);
+}
 
 // =======================
 // JWT TTL (controle de demo vs produção)
@@ -39,10 +44,11 @@ const JWT_EXPIRES_IN =
       : DEFAULT_PROD_EXPIRES_IN
     : DEFAULT_DEV_EXPIRES_IN);
 
-function generateToken(user) {
+function generateToken(user, sessionContext = "AUTHOR") {
   const payload = {
     sub: user.user_id,
     email: user.email,
+    session_context: sessionContext,
   };
 
   if (user.author_id) {
@@ -178,6 +184,12 @@ async function ensureAuthorForUser(pool, user, fullNameFallback = null, preferre
     throw new Error("ensureAuthorForUser requer user válido.");
   }
 
+  if (isCorporateOperatorEmail(user.email)) {
+    const err = new Error("Identidade corporativa @hdud.ai não pode ser convertida em AUTHOR.");
+    err.code = "OPERATOR_IDENTITY_AUTHOR_CREATION_FORBIDDEN";
+    throw err;
+  }
+
   if (user.author_id) {
     const existingAuthor = await getAuthorById(pool, user.author_id);
     if (existingAuthor) return existingAuthor;
@@ -283,6 +295,13 @@ router.post("/signup", signupRateLimiter, async (req, res) => {
     });
   }
 
+  if (isCorporateOperatorEmail(email)) {
+    return res.status(403).json({
+      error: "Identidades corporativas @hdud.ai pertencem exclusivamente à Administração HDUD.",
+      code: "OPERATOR_IDENTITY_AUTHOR_SIGNUP_FORBIDDEN",
+    });
+  }
+
   try {
     const pool = await getPool();
 
@@ -327,7 +346,7 @@ router.post("/signup", signupRateLimiter, async (req, res) => {
       full_name,
     });
 
-    const accessToken = generateToken(user);
+    const accessToken = generateToken(user, "AUTHOR");
 
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -335,7 +354,9 @@ router.post("/signup", signupRateLimiter, async (req, res) => {
     const userAgent = req.headers["user-agent"] || null;
 
     const session = await createSession({
+      userId: user.user_id,
       authorId: user.author_id,
+      sessionContext: "AUTHOR",
       expiresAt,
       createdIp,
       userAgent,
@@ -392,6 +413,13 @@ router.post("/login", loginRateLimiter, async (req, res) => {
       return res.status(401).json({ error: "Credenciais inválidas." });
     }
 
+    if (isCorporateOperatorEmail(userDb.email)) {
+      return res.status(403).json({
+        error: "Conta corporativa de operador. Utilize o acesso da Administração HDUD.",
+        code: "OPERATOR_IDENTITY_AUTHOR_LOGIN_FORBIDDEN",
+      });
+    }
+
     let author = null;
 
     if (!userDb.author_id) {
@@ -402,7 +430,7 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     }
 
     const user = buildUserPayload(userDb);
-    const accessToken = generateToken(user);
+    const accessToken = generateToken(user, "AUTHOR");
 
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -410,7 +438,9 @@ router.post("/login", loginRateLimiter, async (req, res) => {
     const userAgent = req.headers["user-agent"] || null;
 
     const session = await createSession({
+      userId: user.user_id,
       authorId: user.author_id,
+      sessionContext: "AUTHOR",
       expiresAt,
       createdIp,
       userAgent,
@@ -450,7 +480,7 @@ router.post("/refresh", async (req, res) => {
 
     const pool = await getPool();
 
-    const userDb = await getUserByAuthorId(pool, session.author_id);
+    const userDb = await getUserById(pool, session.user_id);
 
     if (!userDb) {
       return res.status(404).json({
@@ -458,9 +488,23 @@ router.post("/refresh", async (req, res) => {
       });
     }
 
+    if (String(session.session_context || "").trim().toUpperCase() !== "AUTHOR") {
+      return res.status(403).json({
+        error: "Refresh token não pertence a uma sessão AUTHOR.",
+        code: "AUTHOR_REFRESH_CONTEXT_REQUIRED",
+      });
+    }
+
+    if (isCorporateOperatorEmail(userDb.email)) {
+      return res.status(403).json({
+        error: "Conta corporativa de operador não pode renovar sessão AUTHOR.",
+        code: "OPERATOR_IDENTITY_AUTHOR_REFRESH_FORBIDDEN",
+      });
+    }
+
     const author = userDb.author_id ? await getAuthorById(pool, userDb.author_id) : null;
     const user = buildUserPayload(userDb);
-    const accessToken = generateToken(user);
+    const accessToken = generateToken(user, session.session_context);
 
     return res.json({
       user,
@@ -506,6 +550,13 @@ router.get("/me", authenticate, async (req, res) => {
       return res.status(401).json({ error: "Não autenticado." });
     }
 
+    if (String(req.user?.session_context || "").trim().toUpperCase() !== "AUTHOR") {
+      return res.status(403).json({
+        error: "Esta rota pertence exclusivamente ao contexto AUTHOR.",
+        code: "AUTHOR_SESSION_CONTEXT_REQUIRED",
+      });
+    }
+
     const pool = await getPool();
 
     const userId = req.user.sub;
@@ -530,6 +581,13 @@ router.get("/me", authenticate, async (req, res) => {
 
     const userDb = userResult.recordset[0];
 
+    if (isCorporateOperatorEmail(userDb.email)) {
+      return res.status(403).json({
+        error: "Conta corporativa de operador não possui identidade AUTHOR.",
+        code: "OPERATOR_IDENTITY_AUTHOR_ME_FORBIDDEN",
+      });
+    }
+
     let author = null;
     if (authorId) {
       author = await getAuthorById(pool, authorId);
@@ -542,6 +600,7 @@ router.get("/me", authenticate, async (req, res) => {
         created_at: userDb.created_at,
         author_id: userDb.author_id,
         roles: req.user.roles || ["AUTHOR_SELF"],
+        session_context: req.user.session_context || "AUTHOR",
       },
       author,
     });

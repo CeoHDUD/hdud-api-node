@@ -387,6 +387,251 @@ router.get("/summary", authenticate, async (req, res) => {
   }
 });
 
+
+// ============================
+// FOLLOWERS / FOLLOWING LISTS
+// ============================
+
+router.get("/followers", authenticate, async (req, res) => {
+  try {
+    const authorId = getAuthorId(req);
+    if (!authorId) {
+      return res.status(401).json({ error: "Não autenticado." });
+    }
+
+    const limit = clampInt(req.query?.limit, 1, 100, 50);
+    const offset = clampInt(req.query?.offset, 0, 100000, 0);
+    const pool = await getPool();
+
+    const result = await pool
+      .request()
+      .input("me", sql.Int, authorId)
+      .input("limit", sql.Int, limit)
+      .input("offset", sql.Int, offset)
+      .query(`
+        WITH follower_ids AS (
+          SELECT
+            f.follower_id AS author_id
+          FROM dbo.identity_follow f
+          WHERE f.followed_id = @me
+        ),
+        memory_stats AS (
+          SELECT
+            m.author_id,
+            COUNT(*) AS total_memories,
+            MAX(m.created_at) AS last_memory_created_at
+          FROM dbo.identity_memory m
+          WHERE ISNULL(m.is_deleted, 0) = 0
+          GROUP BY m.author_id
+        ),
+        base AS (
+          SELECT
+            a.author_id,
+            a.author_code,
+            a.full_name,
+            a.name_public,
+            a.bio_short,
+            a.location,
+            a.avatar_url,
+            a.created_at,
+            a.updated_at,
+            ISNULL(ms.total_memories, 0) AS total_memories,
+            ms.last_memory_created_at,
+            last_memory.memory_preview,
+            is_following = CASE WHEN EXISTS (
+              SELECT 1 FROM dbo.identity_follow fx
+              WHERE fx.follower_id = @me AND fx.followed_id = a.author_id
+            ) THEN 1 ELSE 0 END,
+            follows_me = 1,
+            has_pending_invite_from_me = CASE WHEN EXISTS (
+              SELECT 1 FROM dbo.identity_network_invite i
+              WHERE i.from_author_id = @me
+                AND i.to_author_id = a.author_id
+                AND i.status = 'pending'
+            ) THEN 1 ELSE 0 END,
+            has_pending_invite_to_me = CASE WHEN EXISTS (
+              SELECT 1 FROM dbo.identity_network_invite i
+              WHERE i.from_author_id = a.author_id
+                AND i.to_author_id = @me
+                AND i.status = 'pending'
+            ) THEN 1 ELSE 0 END,
+            mutual_connections = 0,
+            mutual_preview_names = NULL,
+            SCORE = ISNULL(ms.total_memories, 0),
+            COUNT(*) OVER() AS total_count
+          FROM follower_ids fl
+          INNER JOIN dbo.identity_author a
+            ON a.author_id = fl.author_id
+          LEFT JOIN memory_stats ms
+            ON ms.author_id = a.author_id
+          OUTER APPLY (
+            SELECT TOP 1
+              m.content AS memory_preview
+            FROM dbo.identity_memory m
+            WHERE m.author_id = a.author_id
+              AND ISNULL(m.is_deleted, 0) = 0
+            ORDER BY m.created_at DESC, m.memory_id DESC
+          ) last_memory
+          WHERE a.author_id <> @me
+        )
+        SELECT *
+        FROM base
+        ORDER BY author_id DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    const rows = result.recordset || [];
+    const total = rows.length > 0 ? Number(rows[0].total_count || 0) : 0;
+    const items = rows.map((row) =>
+      mapAuthorCard({
+        ...row,
+        recent_activity_label: row.last_memory_created_at ? "Ativo por memórias" : null,
+        primary_reason: "Acompanha sua narrativa",
+        reasons: ["Acompanha sua narrativa"],
+      })
+    );
+
+    return res.json({
+      ok: true,
+      author_id: authorId,
+      kind: "followers",
+      total,
+      items,
+      followers: items,
+      pagination: {
+        limit,
+        offset,
+        count: items.length,
+        has_more: offset + items.length < total,
+      },
+      meta: { generated_at: new Date().toISOString() },
+    });
+  } catch (err) {
+    console.error("[network.followers]", err);
+    return res.status(500).json({ error: "Erro ao carregar seguidores." });
+  }
+});
+
+router.get("/following", authenticate, async (req, res) => {
+  try {
+    const authorId = getAuthorId(req);
+    if (!authorId) {
+      return res.status(401).json({ error: "Não autenticado." });
+    }
+
+    const limit = clampInt(req.query?.limit, 1, 100, 50);
+    const offset = clampInt(req.query?.offset, 0, 100000, 0);
+    const pool = await getPool();
+
+    const result = await pool
+      .request()
+      .input("me", sql.Int, authorId)
+      .input("limit", sql.Int, limit)
+      .input("offset", sql.Int, offset)
+      .query(`
+        WITH following_ids AS (
+          SELECT
+            f.followed_id AS author_id
+          FROM dbo.identity_follow f
+          WHERE f.follower_id = @me
+        ),
+        memory_stats AS (
+          SELECT
+            m.author_id,
+            COUNT(*) AS total_memories,
+            MAX(m.created_at) AS last_memory_created_at
+          FROM dbo.identity_memory m
+          WHERE ISNULL(m.is_deleted, 0) = 0
+          GROUP BY m.author_id
+        ),
+        base AS (
+          SELECT
+            a.author_id,
+            a.author_code,
+            a.full_name,
+            a.name_public,
+            a.bio_short,
+            a.location,
+            a.avatar_url,
+            a.created_at,
+            a.updated_at,
+            ISNULL(ms.total_memories, 0) AS total_memories,
+            ms.last_memory_created_at,
+            last_memory.memory_preview,
+            is_following = 1,
+            follows_me = CASE WHEN EXISTS (
+              SELECT 1 FROM dbo.identity_follow fx
+              WHERE fx.follower_id = a.author_id AND fx.followed_id = @me
+            ) THEN 1 ELSE 0 END,
+            has_pending_invite_from_me = CASE WHEN EXISTS (
+              SELECT 1 FROM dbo.identity_network_invite i
+              WHERE i.from_author_id = @me
+                AND i.to_author_id = a.author_id
+                AND i.status = 'pending'
+            ) THEN 1 ELSE 0 END,
+            has_pending_invite_to_me = CASE WHEN EXISTS (
+              SELECT 1 FROM dbo.identity_network_invite i
+              WHERE i.from_author_id = a.author_id
+                AND i.to_author_id = @me
+                AND i.status = 'pending'
+            ) THEN 1 ELSE 0 END,
+            mutual_connections = 0,
+            mutual_preview_names = NULL,
+            SCORE = ISNULL(ms.total_memories, 0),
+            COUNT(*) OVER() AS total_count
+          FROM following_ids fl
+          INNER JOIN dbo.identity_author a
+            ON a.author_id = fl.author_id
+          LEFT JOIN memory_stats ms
+            ON ms.author_id = a.author_id
+          OUTER APPLY (
+            SELECT TOP 1
+              m.content AS memory_preview
+            FROM dbo.identity_memory m
+            WHERE m.author_id = a.author_id
+              AND ISNULL(m.is_deleted, 0) = 0
+            ORDER BY m.created_at DESC, m.memory_id DESC
+          ) last_memory
+          WHERE a.author_id <> @me
+        )
+        SELECT *
+        FROM base
+        ORDER BY author_id DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    const rows = result.recordset || [];
+    const total = rows.length > 0 ? Number(rows[0].total_count || 0) : 0;
+    const items = rows.map((row) =>
+      mapAuthorCard({
+        ...row,
+        recent_activity_label: row.last_memory_created_at ? "Ativo por memórias" : null,
+        primary_reason: "Você acompanha esta narrativa",
+        reasons: ["Você acompanha esta narrativa"],
+      })
+    );
+
+    return res.json({
+      ok: true,
+      author_id: authorId,
+      kind: "following",
+      total,
+      items,
+      following: items,
+      pagination: {
+        limit,
+        offset,
+        count: items.length,
+        has_more: offset + items.length < total,
+      },
+      meta: { generated_at: new Date().toISOString() },
+    });
+  } catch (err) {
+    console.error("[network.following]", err);
+    return res.status(500).json({ error: "Erro ao carregar autores seguidos." });
+  }
+});
+
 // ============================
 // MUTUAL CONNECTIONS
 // ============================
@@ -1368,6 +1613,120 @@ router.post("/invite/:id/reject", authenticate, async (req, res) => {
   } catch (err) {
     console.error("[network.invite.reject]", err);
     return res.status(500).json({ error: "Erro ao rejeitar convite." });
+  }
+});
+
+
+// ============================
+// PROFILE PREVIEW
+// ============================
+
+router.get("/profile/:id", authenticate, async (req, res) => {
+  try {
+    const authorId = getAuthorId(req);
+    const profileId = Number(req.params.id);
+
+    if (!authorId) {
+      return res.status(401).json({ error: "Não autenticado." });
+    }
+
+    if (!Number.isInteger(profileId) || profileId <= 0) {
+      return res.status(400).json({ error: "Autor inválido." });
+    }
+
+    const pool = await getPool();
+
+    const result = await pool
+      .request()
+      .input("me", sql.Int, authorId)
+      .input("profile_id", sql.Int, profileId)
+      .query(`
+        WITH memory_stats AS (
+          SELECT
+            m.author_id,
+            COUNT(*) AS total_memories,
+            MAX(m.created_at) AS last_memory_created_at,
+            MAX(CAST(m.content AS nvarchar(max))) AS memory_preview
+          FROM dbo.identity_memory m
+          WHERE ISNULL(m.is_deleted, 0) = 0
+            AND UPPER(ISNULL(m.publication_status, 'DRAFT')) = 'PUBLISHED'
+          GROUP BY m.author_id
+        ),
+        mutuals AS (
+          SELECT COUNT(*) AS mutual_connections
+          FROM dbo.identity_follow mine
+          INNER JOIN dbo.identity_follow theirs
+            ON theirs.followed_id = mine.followed_id
+           AND theirs.follower_id = @profile_id
+          WHERE mine.follower_id = @me
+            AND mine.followed_id <> @profile_id
+        )
+        SELECT TOP 1
+          a.author_id,
+          a.author_code,
+          a.full_name,
+          a.name_public,
+          a.bio_short,
+          a.location,
+          a.avatar_url,
+          a.created_at,
+          a.updated_at,
+          u.email,
+          ISNULL(ms.total_memories, 0) AS total_memories,
+          ms.last_memory_created_at,
+          ms.memory_preview,
+          ISNULL(mx.mutual_connections, 0) AS mutual_connections,
+          CASE WHEN f1.followed_id IS NULL THEN 0 ELSE 1 END AS is_following,
+          CASE WHEN f2.follower_id IS NULL THEN 0 ELSE 1 END AS follows_me,
+          CASE WHEN i1.invite_id IS NULL THEN 0 ELSE 1 END AS has_pending_invite_from_me,
+          CASE WHEN i2.invite_id IS NULL THEN 0 ELSE 1 END AS has_pending_invite_to_me,
+          CASE WHEN NULLIF(LTRIM(RTRIM(ISNULL(a.bio_short, ''))), '') IS NULL THEN 0 ELSE 1 END AS has_bio,
+          CASE WHEN NULLIF(LTRIM(RTRIM(ISNULL(a.avatar_url, ''))), '') IS NULL THEN 0 ELSE 1 END AS has_avatar,
+          CASE WHEN NULLIF(LTRIM(RTRIM(ISNULL(a.location, ''))), '') IS NULL THEN 0 ELSE 1 END AS has_location,
+          CASE
+            WHEN ms.last_memory_created_at >= DATEADD(day, -14, SYSUTCDATETIME()) THEN 1
+            ELSE 0
+          END AS is_recently_active
+        FROM dbo.identity_author a
+        LEFT JOIN dbo.identity_user u
+          ON u.user_id = a.user_id
+        LEFT JOIN memory_stats ms
+          ON ms.author_id = a.author_id
+        CROSS JOIN mutuals mx
+        LEFT JOIN dbo.identity_follow f1
+          ON f1.follower_id = @me
+         AND f1.followed_id = a.author_id
+        LEFT JOIN dbo.identity_follow f2
+          ON f2.follower_id = a.author_id
+         AND f2.followed_id = @me
+        LEFT JOIN dbo.identity_network_invite i1
+          ON i1.from_author_id = @me
+         AND i1.to_author_id = a.author_id
+         AND i1.status = 'pending'
+        LEFT JOIN dbo.identity_network_invite i2
+          ON i2.from_author_id = a.author_id
+         AND i2.to_author_id = @me
+         AND i2.status = 'pending'
+        WHERE a.author_id = @profile_id;
+      `);
+
+    const profile = mapAuthorCard(result.recordset?.[0]);
+
+    if (!profile) {
+      return res.status(404).json({ error: "Perfil não encontrado." });
+    }
+
+    return res.json({
+      ok: true,
+      profile,
+      author: profile,
+      meta: {
+        generated_at: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    console.error("[network.profile]", err);
+    return res.status(500).json({ error: "Erro ao carregar perfil da rede." });
   }
 });
 

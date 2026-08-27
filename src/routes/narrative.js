@@ -343,6 +343,7 @@ router.get("/clusters", authRequired, async (req, res) => {
       .query(`
         SELECT
           m.memory_id,
+          m.author_id,
           m.title,
           m.content,
           m.created_at,
@@ -574,6 +575,7 @@ router.post("/refine-memory", authRequired, async (req, res) => {
       .query(`
         SELECT
           m.memory_id,
+          m.author_id,
           m.title,
           m.content,
           p.phase_code
@@ -608,6 +610,13 @@ router.post("/refine-memory", authRequired, async (req, res) => {
           language: req.body?.language,
         },
         voiceProfile,
+        usageContext: {
+          userId: Number(req.user?.user_id || req.user?.userId || req.user?.id || req.user?.uid || req.user?.sub) || null,
+          authorId,
+          operationCode: "MEMORY_EDITORIAL_REFINE",
+          entityType: "MEMORY",
+          entityId: memoryId,
+        },
       });
     } catch (err) {
       console.error("[MEMORY_REFINER_ERROR]", err);
@@ -627,6 +636,8 @@ router.post("/refine-memory", authRequired, async (req, res) => {
           phase_code: memory.phase_code || null,
         },
         refinement: aiResult.result,
+		  editorial_guard:
+			aiResult.editorial_guard || null,
         voice_profile: voiceProfile
           ? {
               loaded: true,
@@ -648,12 +659,44 @@ router.post("/refine-memory", authRequired, async (req, res) => {
       });
     }
 
-    return res.status(500).json({
-      ok: false,
-      error: "Falha no refinamento IA.",
-      detail: aiResult?.reason || "OpenAI indisponÃ­vel.",
-      voice_profile_loaded: Boolean(voiceProfile),
-    });
+    const reason = aiResult?.reason || "OpenAI indisponível.";
+
+	if (reason === "EDITORIAL_CONTENT_LOSS_DETECTED") {
+	  return res.status(422).json({
+		ok: false,
+
+		error: "EDITORIAL_CONTENT_LOSS_DETECTED",
+
+		message:
+		  "A sugestão editorial apresentou risco de perda de conteúdo e foi rejeitada automaticamente.",
+
+		editorial_guard:
+		  aiResult?.editorial_guard || null,
+
+		memory: {
+		  memory_id: Number(memory.memory_id),
+		  title: memory.title || null,
+		},
+
+		voice_profile_loaded: Boolean(
+		  voiceProfile
+		),
+
+		retry_allowed: true,
+
+		source_policy:
+		  "Memória original preservada. Nenhuma alteração foi aplicada.",
+	  });
+	}
+
+	return res.status(500).json({
+	  ok: false,
+	  error: "Falha no refinamento IA.",
+	  detail: reason,
+	  voice_profile_loaded: Boolean(
+		voiceProfile
+	  ),
+	});
   } catch (err) {
     console.error("[REFINE_MEMORY_ROUTE_ERROR]", err);
 

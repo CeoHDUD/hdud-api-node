@@ -47,7 +47,7 @@ function toNumberOrNull(value) {
 
 function normalizeTargetType(value) {
   const s = String(value ?? "").trim().toUpperCase();
-  if (s === "MEMORY" || s === "CHAPTER") return s;
+  if (s === "MEMORY" || s === "CHAPTER" || s === "BOOK") return s;
   return null;
 }
 
@@ -106,6 +106,28 @@ async function resolveTarget(pool, targetType, targetId) {
         FROM dbo.identity_memory m
         WHERE m.memory_id = @target_id
           AND ISNULL(m.is_deleted, 0) = 0;
+      `);
+
+    return r.recordset?.[0] || null;
+  }
+
+
+  if (targetType === "BOOK") {
+    const r = await pool
+      .request()
+      .input("target_id", sql.Int, targetId)
+      .query(`
+        SELECT TOP 1
+          CAST('BOOK' AS varchar(20)) AS target_type,
+          b.book_id AS target_id,
+          b.author_id,
+          b.title,
+          COALESCE(b.synopsis, b.subtitle, b.title, '') AS content,
+          b.published_at,
+          b.status AS publication_status
+        FROM dbo.identity_book b
+        WHERE b.book_id = @target_id
+          AND ISNULL(b.is_deleted, 0) = 0;
       `);
 
     return r.recordset?.[0] || null;
@@ -193,8 +215,9 @@ function buildItemsFromRows(rows, commentMap) {
     const author_id = toNumberOrNull(row.author_id);
     const chapter_id = toNumberOrNull(row.chapter_id);
     const memory_id = toNumberOrNull(row.memory_id);
-    const targetType = String(row.item_type || "").toLowerCase() === "memory" ? "MEMORY" : "CHAPTER";
-    const targetId = targetType === "MEMORY" ? memory_id : chapter_id;
+    const itemType = String(row.item_type || "").toLowerCase();
+    const targetType = itemType === "memory" ? "MEMORY" : itemType === "book" ? "BOOK" : "CHAPTER";
+    const targetId = targetType === "MEMORY" ? memory_id : targetType === "CHAPTER" ? chapter_id : toNumberOrNull(row.source_id);
 
     const counts = {
       likes: Number(row.total_reactions || 0),
@@ -251,6 +274,43 @@ function buildItemsFromRows(rows, commentMap) {
       };
     }
 
+    if (String(row.item_type || "").toLowerCase() === "book") {
+      return {
+        type: "book",
+        title: row.title ?? "",
+        date: row.activity_at,
+        source_id: String(row.source_id),
+        authorId: author_id,
+        authorName: row.author_name ?? null,
+        authorCode: row.author_code ?? null,
+        relationshipType,
+        originScope,
+        relevanceScore,
+        meta: {
+          nav: row.nav || `/books`,
+          date_source: "published_at",
+          activity_at: row.activity_at ?? null,
+          preview: safeText(row.preview_text, 320),
+          publication_status: publicationStatus,
+          published_at: row.published_at ?? null,
+          book_id: toNumberOrNull(row.source_id),
+          chapter_id: null,
+          memory_id: null,
+          status: publicationStatus,
+          author_id,
+          author_name: row.author_name ?? null,
+          author_code: row.author_code ?? null,
+          relationship_type: relationshipType,
+          origin_scope: originScope,
+          relevance_score: relevanceScore,
+          social,
+          counts,
+          liked_by_me: !!row.liked_by_me,
+          comments_preview: commentsPreview,
+        },
+      };
+    }
+
     return {
       type: "memory",
       title: row.title ?? "",
@@ -293,11 +353,18 @@ function buildItemsFromRows(rows, commentMap) {
 async function buildCommentMapFromRows(pool, rows) {
   const commentKeys = rows.map((row) => ({
     item_type: String(row.item_type || "").toLowerCase(),
-    target_type: String(row.item_type || "").toLowerCase() === "memory" ? "MEMORY" : "CHAPTER",
+    target_type:
+      String(row.item_type || "").toLowerCase() === "memory"
+        ? "MEMORY"
+        : String(row.item_type || "").toLowerCase() === "book"
+          ? "BOOK"
+          : "CHAPTER",
     target_id:
       String(row.item_type || "").toLowerCase() === "memory"
         ? toNumberOrNull(row.memory_id)
-        : toNumberOrNull(row.chapter_id),
+        : String(row.item_type || "").toLowerCase() === "book"
+          ? toNumberOrNull(row.source_id)
+          : toNumberOrNull(row.chapter_id),
   }));
 
   const commentMap = new Map();
@@ -311,6 +378,116 @@ async function buildCommentMapFromRows(pool, rows) {
   }
 
   return commentMap;
+}
+
+async function enrichChapterItems(pool, items) {
+  const chapterIds = [...new Set(
+    (items || [])
+      .filter((item) => item?.type === "chapter")
+      .map((item) => Number(item?.meta?.chapter_id || item?.source_id || 0))
+      .filter((id) => Number.isInteger(id) && id > 0)
+  )];
+
+  if (!chapterIds.length) return items;
+
+  const chapterIdsJson = JSON.stringify(chapterIds);
+
+  const bodyResult = await pool
+    .request()
+    .input("chapter_ids_json", sql.NVarChar(sql.MAX), chapterIdsJson)
+    .query(`
+      SELECT
+        c.chapter_id,
+        COALESCE(cv.body, '') AS chapter_body
+      FROM dbo.identity_chapter c
+      OUTER APPLY (
+        SELECT TOP 1 v.body
+        FROM dbo.identity_chapter_versions v
+        WHERE v.chapter_id = c.chapter_id
+        ORDER BY
+          CASE WHEN v.chapter_version_id = c.current_version_id THEN 0 ELSE 1 END,
+          v.created_at DESC,
+          v.chapter_version_id DESC
+      ) cv
+      WHERE c.chapter_id IN (
+        SELECT TRY_CONVERT(int, [value])
+        FROM OPENJSON(@chapter_ids_json)
+      )
+        AND ISNULL(c.is_deleted, 0) = 0;
+    `);
+
+  const memoriesResult = await pool
+    .request()
+    .input("chapter_ids_json", sql.NVarChar(sql.MAX), chapterIdsJson)
+    .query(`
+      SELECT
+        mc.chapter_id,
+        mc.memory_id,
+        m.author_id,
+        m.title,
+        mc.sort_order,
+        media.media_id,
+        COALESCE(
+          NULLIF(LTRIM(RTRIM(CONVERT(varchar(1000), m.photo_url))), ''),
+          CONCAT('/cdn/memories/', CAST(m.author_id AS varchar(50)), '/', CAST(m.memory_id AS varchar(50)))
+        ) AS photo_url
+      FROM dbo.identity_memory_chapter mc
+      INNER JOIN dbo.identity_memory m
+        ON m.memory_id = mc.memory_id
+       AND m.author_id = mc.author_id
+      OUTER APPLY (
+        SELECT TOP 1 imm.media_id
+        FROM dbo.identity_memory_media imm
+        WHERE imm.memory_id = m.memory_id
+          AND imm.author_id = m.author_id
+          AND imm.media_type = 'image'
+          AND ISNULL(imm.is_deleted, 0) = 0
+        ORDER BY imm.is_primary_for_memory DESC, imm.created_at DESC, imm.media_id DESC
+      ) media
+      WHERE mc.chapter_id IN (
+        SELECT TRY_CONVERT(int, [value])
+        FROM OPENJSON(@chapter_ids_json)
+      )
+        AND ISNULL(m.is_deleted, 0) = 0
+      ORDER BY mc.chapter_id,
+        CASE WHEN mc.sort_order IS NULL THEN 1 ELSE 0 END,
+        mc.sort_order,
+        mc.created_at,
+        mc.memory_id;
+    `);
+
+  const bodyMap = new Map(
+    (bodyResult.recordset || []).map((row) => [Number(row.chapter_id), String(row.chapter_body || '')])
+  );
+  const memoriesMap = new Map();
+
+  for (const row of memoriesResult.recordset || []) {
+    const chapterId = Number(row.chapter_id);
+    if (!memoriesMap.has(chapterId)) memoriesMap.set(chapterId, []);
+    memoriesMap.get(chapterId).push({
+      memory_id: Number(row.memory_id),
+      author_id: Number(row.author_id),
+      title: row.title ?? null,
+      sort_order: row.sort_order != null ? Number(row.sort_order) : null,
+      media_id: row.media_id != null ? Number(row.media_id) : null,
+      photo_url: row.photo_url ?? null,
+    });
+  }
+
+  return (items || []).map((item) => {
+    if (item?.type !== "chapter") return item;
+    const chapterId = Number(item?.meta?.chapter_id || item?.source_id || 0);
+    const chapterBody = bodyMap.get(chapterId) || String(item?.meta?.description || item?.meta?.preview || '');
+    return {
+      ...item,
+      content: chapterBody,
+      meta: {
+        ...(item.meta || {}),
+        chapter_body: chapterBody,
+        chapter_memories: memoriesMap.get(chapterId) || [],
+      },
+    };
+  });
 }
 
 async function queryDashboardFeed(pool, authorId, limit) {
@@ -483,7 +660,7 @@ async function queryDashboardFeed(pool, authorId, limit) {
               CASE
                 WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
                   THEN COALESCE(
-                    NULLIF(CONVERT(varchar(50), c.publication_status), ''),
+                    NULLIF(LTRIM(RTRIM(CONVERT(varchar(50), c.publication_status))), ''),
                     CONVERT(varchar(50), c.status)
                   )
                 ELSE CONVERT(varchar(50), c.status)
@@ -493,10 +670,50 @@ async function queryDashboardFeed(pool, authorId, limit) {
           AND c.published_at IS NOT NULL
           AND c.author_id <> @viewer_author_id
       ),
+      direct_book_feed AS (
+        SELECT
+          CAST('book' AS varchar(20)) AS item_type,
+          CAST(b.book_id AS varchar(50)) AS source_id,
+          b.author_id,
+          na.author_name,
+          na.author_code,
+          na.relationship_type,
+          na.origin_scope,
+          na.relationship_score,
+          b.title AS title,
+          b.published_at AS activity_at,
+          CONCAT('/books?open=', CAST(b.book_id AS varchar(50))) AS nav,
+          COALESCE(b.synopsis, b.subtitle, b.title, '') AS preview_text,
+          CAST(NULL AS varchar(50)) AS phase_code,
+          CAST(NULL AS varchar(500)) AS photo_url,
+          CONVERT(varchar(50), b.status) AS publication_status_raw,
+          b.published_at AS published_at,
+          CAST(NULL AS int) AS chapter_id,
+          CAST(NULL AS int) AS memory_id,
+          CAST(NULL AS varchar(30)) AS social_event_type,
+          CAST(NULL AS int) AS social_actor_author_id,
+          CAST(NULL AS nvarchar(120)) AS social_actor_name,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type,
+          CAST(
+            na.relationship_score + 260 + CASE WHEN b.published_at IS NOT NULL THEN 50 ELSE 0 END
+            AS int
+          ) AS relevance_score
+        FROM dbo.identity_book b
+        INNER JOIN network_authors na
+          ON na.author_id = b.author_id
+        WHERE ISNULL(b.is_deleted, 0) = 0
+          AND UPPER(LTRIM(RTRIM(ISNULL(CONVERT(varchar(50), b.status), '')))) IN ('PUBLIC', 'PUBLISHED', 'SHARED')
+          AND b.published_at IS NOT NULL
+          AND b.author_id <> @viewer_author_id
+      ),
+
       direct_feed AS (
         SELECT * FROM direct_memory_feed
         UNION ALL
         SELECT * FROM direct_chapter_feed
+        UNION ALL
+        SELECT * FROM direct_book_feed
       ),
 
       social_event_candidates AS (
@@ -678,7 +895,7 @@ async function queryDashboardFeed(pool, authorId, limit) {
               CASE
                 WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
                   THEN COALESCE(
-                    NULLIF(CONVERT(varchar(50), c.publication_status), ''),
+                    NULLIF(LTRIM(RTRIM(CONVERT(varchar(50), c.publication_status))), ''),
                     CONVERT(varchar(50), c.status)
                   )
                 ELSE CONVERT(varchar(50), c.status)
@@ -785,28 +1002,28 @@ async function queryDashboardFeed(pool, authorId, limit) {
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_reactions
         FROM dbo.identity_feed_reaction r
-        WHERE r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+        WHERE r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
       ) reactions
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_comments
         FROM dbo.identity_feed_comment c
-        WHERE c.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND c.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+        WHERE c.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND c.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
           AND ISNULL(c.is_deleted, 0) = 0
       ) comments
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_shares
         FROM dbo.identity_feed_share s
-        WHERE s.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND s.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+        WHERE s.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND s.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
       ) shares
       OUTER APPLY (
         SELECT TOP 1 r.reaction_id
         FROM dbo.identity_feed_reaction r
         WHERE r.author_id = @viewer_author_id
-          AND r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+          AND r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
       ) my_like
       WHERE u.rn = 1
       ORDER BY
@@ -818,10 +1035,11 @@ async function queryDashboardFeed(pool, authorId, limit) {
   return result.recordset || [];
 }
 
-async function queryAuthorProfileFeed(pool, authorId, limit) {
+async function queryAuthorProfileFeed(pool, viewerAuthorId, targetAuthorId, limit) {
   const result = await pool
     .request()
-    .input("viewer_author_id", sql.Int, authorId)
+    .input("viewer_author_id", sql.Int, viewerAuthorId)
+    .input("target_author_id", sql.Int, targetAuthorId)
     .input("limit", sql.Int, limit)
     .query(`
       WITH self_memory_feed AS (
@@ -931,7 +1149,7 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           ) x
           ORDER BY x.created_at DESC
         ) last_social
-        WHERE m.author_id = @viewer_author_id
+        WHERE m.author_id = @target_author_id
           AND ISNULL(m.is_deleted, 0) = 0
           AND UPPER(LTRIM(RTRIM(ISNULL(CONVERT(varchar(50), m.publication_status), '')))) = 'PUBLISHED'
           AND m.published_at IS NOT NULL
@@ -1049,14 +1267,14 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           ) x
           ORDER BY x.created_at DESC
         ) last_social
-        WHERE c.author_id = @viewer_author_id
+        WHERE c.author_id = @target_author_id
           AND ISNULL(c.is_deleted, 0) = 0
           AND UPPER(
             LTRIM(RTRIM(
               CASE
                 WHEN COL_LENGTH('dbo.identity_chapter', 'publication_status') IS NOT NULL
                   THEN COALESCE(
-                    NULLIF(CONVERT(varchar(50), c.publication_status), ''),
+                    NULLIF(LTRIM(RTRIM(CONVERT(varchar(50), c.publication_status))), ''),
                     CONVERT(varchar(50), c.status)
                   )
                 ELSE CONVERT(varchar(50), c.status)
@@ -1065,10 +1283,50 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
           ) IN ('PUBLIC', 'PUBLISHED', 'SHARED')
           AND c.published_at IS NOT NULL
       ),
+      self_book_feed AS (
+        SELECT
+          CAST('book' AS varchar(20)) AS item_type,
+          CAST(b.book_id AS varchar(50)) AS source_id,
+          b.author_id,
+          COALESCE(
+            NULLIF(LTRIM(RTRIM(a.name_public)), ''),
+            NULLIF(LTRIM(RTRIM(a.author_code)), ''),
+            'Autor'
+          ) AS author_name,
+          a.author_code,
+          CAST('self' AS varchar(20)) AS relationship_type,
+          CAST('author_profile' AS varchar(30)) AS origin_scope,
+          CAST(1000 AS int) AS relationship_score,
+          b.title AS title,
+          b.published_at AS activity_at,
+          CONCAT('/books?open=', CAST(b.book_id AS varchar(50))) AS nav,
+          COALESCE(b.synopsis, b.subtitle, b.title, '') AS preview_text,
+          CAST(NULL AS varchar(50)) AS phase_code,
+          CAST(NULL AS varchar(500)) AS photo_url,
+          CONVERT(varchar(50), b.status) AS publication_status_raw,
+          b.published_at AS published_at,
+          CAST(NULL AS int) AS chapter_id,
+          CAST(NULL AS int) AS memory_id,
+          CAST(NULL AS varchar(30)) AS social_event_type,
+          CAST(NULL AS int) AS social_actor_author_id,
+          CAST(NULL AS nvarchar(120)) AS social_actor_name,
+          CAST(NULL AS nvarchar(max)) AS share_comment,
+          CAST(NULL AS varchar(20)) AS share_type,
+          CAST(1180 AS int) AS relevance_score
+        FROM dbo.identity_book b
+        INNER JOIN dbo.identity_author a
+          ON a.author_id = b.author_id
+        WHERE b.author_id = @target_author_id
+          AND ISNULL(b.is_deleted, 0) = 0
+          AND UPPER(LTRIM(RTRIM(ISNULL(CONVERT(varchar(50), b.status), '')))) IN ('PUBLIC', 'PUBLISHED', 'SHARED')
+          AND b.published_at IS NOT NULL
+      ),
       unified AS (
         SELECT * FROM self_memory_feed
         UNION ALL
         SELECT * FROM self_chapter_feed
+        UNION ALL
+        SELECT * FROM self_book_feed
       )
 
       SELECT TOP (@limit)
@@ -1104,28 +1362,28 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_reactions
         FROM dbo.identity_feed_reaction r
-        WHERE r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+        WHERE r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
       ) reactions
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_comments
         FROM dbo.identity_feed_comment c
-        WHERE c.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND c.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+        WHERE c.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND c.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
           AND ISNULL(c.is_deleted, 0) = 0
       ) comments
       OUTER APPLY (
         SELECT COUNT_BIG(1) AS total_shares
         FROM dbo.identity_feed_share s
-        WHERE s.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND s.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+        WHERE s.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND s.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
       ) shares
       OUTER APPLY (
         SELECT TOP 1 r.reaction_id
         FROM dbo.identity_feed_reaction r
         WHERE r.author_id = @viewer_author_id
-          AND r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' ELSE 'CHAPTER' END
-          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id ELSE u.chapter_id END
+          AND r.target_type = CASE WHEN u.item_type = 'memory' THEN 'MEMORY' WHEN u.item_type = 'book' THEN 'BOOK' ELSE 'CHAPTER' END
+          AND r.target_id = CASE WHEN u.item_type = 'memory' THEN u.memory_id WHEN u.item_type = 'book' THEN TRY_CONVERT(int, u.source_id) ELSE u.chapter_id END
       ) my_like
       ORDER BY
         u.activity_at DESC,
@@ -1138,7 +1396,7 @@ async function queryAuthorProfileFeed(pool, authorId, limit) {
 
 router.get("/", authenticate, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
     const authorId = getAuthorId(req);
 
     if (!authorId) {
@@ -1169,12 +1427,39 @@ router.get("/", authenticate, async (req, res) => {
     const profileRow = profileResult?.recordset?.[0] || null;
 
     const authorFeedMode = wantsAuthorFeed(req);
-    const rows = authorFeedMode
-      ? await queryAuthorProfileFeed(pool, authorId, limit)
-      : await queryDashboardFeed(pool, authorId, limit);
+    const requestedTargetAuthorId = Number(req.query?.author_id || req.query?.authorId || 0);
+    const targetAuthorId =
+      authorFeedMode && Number.isInteger(requestedTargetAuthorId) && requestedTargetAuthorId > 0
+        ? requestedTargetAuthorId
+        : authorId;
 
+    if (authorFeedMode && targetAuthorId !== authorId) {
+      const targetExists = await pool
+        .request()
+        .input("target_author_id", sql.Int, targetAuthorId)
+        .query(`
+          SELECT TOP 1 author_id
+          FROM dbo.identity_author
+          WHERE author_id = @target_author_id;
+        `);
+
+      if (!targetExists.recordset?.[0]) {
+        return res.status(404).json({
+          ok: false,
+          error: "Autor não encontrado.",
+        });
+      }
+    }
+
+    const requestedRows = authorFeedMode
+      ? await queryAuthorProfileFeed(pool, authorId, targetAuthorId, limit + 1)
+      : await queryDashboardFeed(pool, authorId, limit + 1);
+
+    const hasMore = requestedRows.length > limit;
+    const rows = hasMore ? requestedRows.slice(0, limit) : requestedRows;
     const commentMap = await buildCommentMapFromRows(pool, rows);
-    const items = buildItemsFromRows(rows, commentMap);
+    const baseItems = buildItemsFromRows(rows, commentMap);
+    const items = await enrichChapterItems(pool, baseItems);
 
     const chapterCount = items.filter((x) => x.type === "chapter").length;
     const memoryCount = items.filter((x) => x.type === "memory").length;
@@ -1193,6 +1478,7 @@ router.get("/", authenticate, async (req, res) => {
         generated_at: new Date().toISOString(),
         limit,
         truth_mode: "published_only",
+        target_author_id: authorFeedMode ? targetAuthorId : null,
         scope_mode: authorFeedMode
           ? "author_profile_with_social_context"
           : "dashboard_network_with_social_activity",
@@ -1201,7 +1487,7 @@ router.get("/", authenticate, async (req, res) => {
         chapter_count: chapterCount,
         memory_count: memoryCount,
         social_activity_count: socialCount,
-        has_more: false,
+        has_more: hasMore,
       },
     });
   } catch (err) {

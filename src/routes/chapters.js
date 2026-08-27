@@ -11,6 +11,40 @@ import {
   generateChapterSuggestion,
   getLatestChapterSuggestion,
 } from "../services/chapters/chapter-ai.service.js";
+import {
+  approveEditorialGeneration,
+  generateEditorialChapter,
+  getEditorialGeneration,
+} from "../services/chapters/chapter-editorial.service.js";
+import {
+  regenerateChapter,
+  acceptChapterRegeneration,
+  discardChapterRegeneration,
+} from "../services/chapters/chapter-regeneration.service.js";
+import {
+  getChapterProvenance,
+} from "../services/chapters/chapter-provenance.service.js";
+import {
+  persistEditedVersionProvenance,
+} from "../services/chapters/chapter-provenance-spans.service.js";
+import {
+  getChapterStoryLineage,
+  linkStoryToChapter,
+  unlinkStoryFromChapter,
+  rebuildChapterStoryLineage,
+} from "../services/chapters/story-chapter-lineage.service.js";
+import {
+  saveApprovedStory,
+} from "../services/story/story-editorial.service.js";
+import {
+  checkPlanFeature,
+  checkNarrativeAiGenerationQuota,
+  reservePlanQuota,
+  reserveNarrativeAiGenerationQuota,
+  commitPlanQuotaReservation,
+  releasePlanQuotaReservation,
+  sendPlanDenied,
+} from "../services/plan-enforcement.service.js";
 
 const router = express.Router();
 
@@ -26,6 +60,21 @@ function ensureAuthorId(req, res) {
     return null;
   }
   return Number(authorId);
+}
+
+function ensureUserId(req, res) {
+  const raw =
+    req?.user?.user_id ??
+    req?.user?.userId ??
+    req?.user?.id ??
+    req?.user?.uid ??
+    req?.user?.sub;
+  const userId = Number(raw);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    res.status(401).json({ error: "user_id não encontrado no token." });
+    return null;
+  }
+  return userId;
 }
 
 function normalizePublicationStatus(value) {
@@ -606,6 +655,224 @@ function buildChapterPublicationSnapshot(detail) {
   };
 }
 
+
+function safeJsonParseObject(value, fallback = null) {
+  try {
+    if (value == null || value === "") return fallback;
+    if (typeof value === "object") return value;
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+async function listChapterVersions(pool, authorId, chapterId) {
+  const okChapter = await assertChapterOwned(pool, authorId, chapterId);
+  if (!okChapter) return null;
+
+  const result = await pool
+    .request()
+    .input("author_id", sql.Int, authorId)
+    .input("chapter_id", sql.Int, chapterId)
+    .query(`
+      SELECT
+        v.chapter_version_id,
+        v.chapter_id,
+        v.author_id,
+        v.title_snapshot,
+        v.body,
+        v.created_at,
+        CASE
+          WHEN c.current_version_id = v.chapter_version_id THEN 1
+          ELSE 0
+        END AS is_current_version,
+        CASE
+          WHEN COL_LENGTH('dbo.identity_chapter', 'published_version_number') IS NOT NULL
+           AND c.published_version_number = v.chapter_version_id THEN 1
+          ELSE 0
+        END AS is_published_version
+      FROM dbo.identity_chapter_versions v
+      INNER JOIN dbo.identity_chapter c
+        ON c.chapter_id = v.chapter_id
+       AND c.author_id = v.author_id
+      WHERE v.chapter_id = @chapter_id
+        AND v.author_id = @author_id
+        AND ISNULL(c.is_deleted, 0) = 0
+      ORDER BY v.chapter_version_id DESC;
+    `);
+
+  return (result?.recordset || []).map((row) => ({
+    chapter_version_id: Number(row.chapter_version_id),
+    chapter_id: Number(row.chapter_id),
+    author_id: Number(row.author_id),
+    title_snapshot: row.title_snapshot ?? null,
+    body: row.body ?? "",
+    created_at: row.created_at ?? null,
+    is_current_version: Number(row.is_current_version ?? 0) === 1,
+    is_published_version: Number(row.is_published_version ?? 0) === 1,
+  }));
+}
+
+async function listChapterTimeline(pool, authorId, chapterId) {
+  const okChapter = await assertChapterOwned(pool, authorId, chapterId);
+  if (!okChapter) return null;
+
+  const result = await pool
+    .request()
+    .input("author_id", sql.Int, authorId)
+    .input("chapter_id", sql.Int, chapterId)
+    .query(`
+      SELECT
+        e.chapter_evolution_id,
+        e.author_id,
+        e.chapter_id,
+        e.event_type,
+        e.source_version_id,
+        e.target_version_id,
+        e.memory_id,
+        m.title AS memory_title,
+        e.metadata_json,
+        e.created_at
+      FROM dbo.identity_chapter_evolution e
+      LEFT JOIN dbo.identity_memory m
+        ON m.memory_id = e.memory_id
+       AND m.author_id = e.author_id
+      WHERE e.author_id = @author_id
+        AND e.chapter_id = @chapter_id
+      ORDER BY e.created_at DESC, e.chapter_evolution_id DESC;
+    `);
+
+  return (result?.recordset || []).map((row) => ({
+    chapter_evolution_id: Number(row.chapter_evolution_id),
+    author_id: Number(row.author_id),
+    chapter_id: Number(row.chapter_id),
+    event_type: row.event_type != null ? String(row.event_type) : null,
+    source_version_id:
+      row.source_version_id != null ? Number(row.source_version_id) : null,
+    target_version_id:
+      row.target_version_id != null ? Number(row.target_version_id) : null,
+    memory_id: row.memory_id != null ? Number(row.memory_id) : null,
+    memory_title: row.memory_title ?? null,
+    metadata: safeJsonParseObject(row.metadata_json, null),
+    created_at: row.created_at ?? null,
+  }));
+}
+
+async function getChapterEditorialProfile(pool, authorId, chapterId) {
+  const okChapter = await assertChapterOwned(pool, authorId, chapterId);
+  if (!okChapter) return null;
+
+  const result = await pool
+    .request()
+    .input("chapter_id", sql.Int, chapterId)
+    .query(`
+      SELECT TOP 1
+        chapter_id,
+        theme,
+        life_phase,
+        period_start,
+        period_end,
+        memory_count,
+        confidence_score,
+        factual_score,
+        updated_at
+      FROM dbo.identity_chapter_editorial_profile
+      WHERE chapter_id = @chapter_id;
+    `);
+
+  const row = result?.recordset?.[0] || null;
+  if (!row) {
+    return {
+      chapter_id: chapterId,
+      theme: null,
+      life_phase: null,
+      period_start: null,
+      period_end: null,
+      memory_count: 0,
+      confidence_score: null,
+      factual_score: null,
+      updated_at: null,
+      empty: true,
+    };
+  }
+
+  return {
+    chapter_id: Number(row.chapter_id),
+    theme: row.theme ?? null,
+    life_phase: row.life_phase ?? null,
+    period_start: row.period_start ?? null,
+    period_end: row.period_end ?? null,
+    memory_count: row.memory_count != null ? Number(row.memory_count) : 0,
+    confidence_score:
+      row.confidence_score != null ? Number(row.confidence_score) : null,
+    factual_score: row.factual_score != null ? Number(row.factual_score) : null,
+    updated_at: row.updated_at ?? null,
+    empty: false,
+  };
+}
+
+
+async function getCurrentChapterVersionId(pool, authorId, chapterId) {
+  const result = await pool
+    .request()
+    .input("author_id", sql.Int, authorId)
+    .input("chapter_id", sql.Int, chapterId)
+    .query(`
+      SELECT TOP 1 current_version_id
+      FROM dbo.identity_chapter
+      WHERE author_id = @author_id
+        AND chapter_id = @chapter_id
+        AND ISNULL(is_deleted, 0) = 0;
+    `);
+
+  const n = Number(result?.recordset?.[0]?.current_version_id ?? 0);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+async function createChapterEvolution(pool, payload) {
+  const metadataJson = (() => {
+    try {
+      return JSON.stringify(payload.metadata ?? {});
+    } catch {
+      return "{}";
+    }
+  })();
+
+  await pool
+    .request()
+    .input("author_id", sql.Int, payload.author_id)
+    .input("chapter_id", sql.Int, payload.chapter_id)
+    .input("event_type", sql.VarChar(50), payload.event_type)
+    .input("source_version_id", sql.Int, payload.source_version_id ?? null)
+    .input("target_version_id", sql.Int, payload.target_version_id ?? null)
+    .input("memory_id", sql.Int, payload.memory_id ?? null)
+    .input("metadata_json", sql.NVarChar(sql.MAX), metadataJson)
+    .query(`
+      INSERT INTO dbo.identity_chapter_evolution
+      (
+        author_id,
+        chapter_id,
+        event_type,
+        source_version_id,
+        target_version_id,
+        memory_id,
+        metadata_json,
+        created_at
+      )
+      VALUES
+      (
+        @author_id,
+        @chapter_id,
+        @event_type,
+        @source_version_id,
+        @target_version_id,
+        @memory_id,
+        @metadata_json,
+        SYSUTCDATETIME()
+      );
+    `);
+}
+
 router.get("/", authRequired, async (req, res, next) => {
   try {
     const authorId = ensureAuthorId(req, res);
@@ -689,6 +956,507 @@ router.post("/", authRequired, async (req, res, next) => {
   }
 });
 
+
+router.post("/story-editorial/save", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const title = String(req.body?.title ?? "").trim();
+    const content = String(
+      req.body?.content ??
+      req.body?.narrative_content ??
+      req.body?.draft?.content ??
+      req.body?.draft?.narrative_content ??
+      ""
+    ).trim();
+
+    const selectedMemoryIds = [
+      ...new Set(
+        (Array.isArray(req.body?.selected_memory_ids)
+          ? req.body.selected_memory_ids
+          : Array.isArray(req.body?.selectedMemoryIds)
+            ? req.body.selectedMemoryIds
+            : []
+        )
+          .map((value) => Number(value))
+          .filter((value) => Number.isInteger(value) && value > 0)
+      ),
+    ];
+
+    if (!title) {
+      return res.status(422).json({ ok: false, error: "A História precisa de um título." });
+    }
+
+    if (content.length < 20) {
+      return res.status(422).json({
+        ok: false,
+        error: "A História precisa de conteúdo narrativo para ser salva.",
+      });
+    }
+
+    if (!selectedMemoryIds.length) {
+      return res.status(422).json({
+        ok: false,
+        error: "A História precisa de ao menos uma memória aprovada.",
+      });
+    }
+
+    const suppliedMemories = Array.isArray(req.body?.memories)
+      ? req.body.memories
+      : [];
+
+    const memories = suppliedMemories.length
+      ? suppliedMemories
+      : selectedMemoryIds.map((memory_id) => ({ memory_id }));
+
+    const result = await saveApprovedStory({
+      authorId,
+      sourceStoryId: req.body?.source_story_id ?? req.body?.sourceStoryId ?? null,
+      persistedStoryId: req.body?.persisted_story_id ?? req.body?.persistedStoryId ?? null,
+      title,
+      subtitle: req.body?.subtitle ?? null,
+      content,
+      editorialPlan: req.body?.editorial_plan ?? req.body?.editorialPlan ?? null,
+      timeline: Array.isArray(req.body?.timeline) ? req.body.timeline : [],
+      memories,
+      relationships: Array.isArray(req.body?.relationships)
+        ? req.body.relationships
+        : Array.isArray(req.body?.lineage)
+          ? req.body.lineage
+          : [],
+      lineage: Array.isArray(req.body?.lineage)
+        ? req.body.lineage
+        : Array.isArray(req.body?.relationships)
+          ? req.body.relationships
+          : [],
+      generationPayload: {
+        ...(req.body?.draft || req.body || {}),
+        hypothesis_id: req.body?.hypothesis_id ?? req.body?.draft?.hypothesis_id ?? null,
+        editorial_plan: req.body?.editorial_plan ?? req.body?.editorialPlan ?? req.body?.draft?.editorial_plan ?? null,
+        lineage: Array.isArray(req.body?.lineage)
+          ? req.body.lineage
+          : Array.isArray(req.body?.relationships)
+            ? req.body.relationships
+            : [],
+        selected_memory_ids: selectedMemoryIds,
+        approval_status: "APPROVED",
+        persistence_source: "chapters.story-editorial.save",
+      },
+    });
+
+    if (!result?.ok) {
+      return res.status(422).json(result || {
+        ok: false,
+        error: "Não conseguimos salvar a História.",
+      });
+    }
+
+    const wasUpdate = Number.isInteger(Number(req.body?.persisted_story_id ?? req.body?.persistedStoryId)) && Number(req.body?.persisted_story_id ?? req.body?.persistedStoryId) > 0;
+    return res.status(wasUpdate ? 200 : 201).json({
+      ...result,
+      approved: true,
+      status: "STORY",
+      hypothesis_id: req.body?.hypothesis_id ?? null,
+      selected_memory_ids: selectedMemoryIds,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+
+router.post("/from-story", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const storyId = toInt(req.body?.story_id ?? req.body?.storyId);
+    if (!Number.isFinite(storyId) || storyId <= 0) {
+      return res.status(400).json({ error: "story_id inválido." });
+    }
+
+    const pool = await getPool();
+    const storyResult = await pool
+      .request()
+      .input("author_id", sql.BigInt, authorId)
+      .input("story_id", sql.BigInt, storyId)
+      .query(`
+        SELECT TOP 1
+          s.story_id,
+          s.title,
+          s.subtitle,
+          v.content
+        FROM dbo.identity_story s
+        OUTER APPLY (
+          SELECT TOP 1 sv.content
+          FROM dbo.identity_story_version sv
+          WHERE sv.story_id = s.story_id
+            AND sv.author_id = s.author_id
+          ORDER BY sv.version_number DESC, sv.story_version_id DESC
+        ) v
+        WHERE s.story_id = @story_id
+          AND s.author_id = @author_id
+          AND ISNULL(s.is_deleted, 0) = 0;
+      `);
+
+    const story = storyResult?.recordset?.[0] || null;
+    if (!story) {
+      return res.status(404).json({ error: "História não encontrada." });
+    }
+
+    const title = String(story.title || "Capítulo sem título").trim();
+    const description = story.subtitle != null ? String(story.subtitle).trim() : null;
+    const body = String(story.content || "");
+
+    if (!body.trim()) {
+      return res.status(422).json({ error: "A História não possui manuscrito para virar Capítulo." });
+    }
+
+    const createResult = await pool
+      .request()
+      .input("author_id", sql.Int, authorId)
+      .input("title", sql.NVarChar(200), title.slice(0, 200))
+      .input("description", sql.NVarChar(400), description ? description.slice(0, 400) : null)
+      .input("body", sql.NVarChar(sql.MAX), body)
+      .input("status", sql.VarChar(20), "DRAFT")
+      .output("chapter_id", sql.Int)
+      .output("chapter_version_id", sql.Int)
+      .execute("dbo.p_Chapter_Create_WithVersion");
+
+    const output = createResult?.output || {};
+    const firstRow = createResult?.recordset?.[0] || null;
+    const chapterId = Number(output.chapter_id ?? firstRow?.chapter_id ?? 0);
+    const chapterVersionId = Number(output.chapter_version_id ?? firstRow?.chapter_version_id ?? 0) || null;
+
+    if (!Number.isInteger(chapterId) || chapterId <= 0) {
+      throw new Error("O Capítulo foi criado sem identificador válido.");
+    }
+
+    const memoriesResult = await pool
+      .request()
+      .input("author_id", sql.BigInt, authorId)
+      .input("story_id", sql.BigInt, storyId)
+      .query(`
+        SELECT memory_id, sort_order
+        FROM dbo.identity_story_memory
+        WHERE story_id = @story_id
+          AND author_id = @author_id
+        ORDER BY sort_order ASC, memory_id ASC;
+      `);
+
+    const memoryRows = memoriesResult?.recordset || [];
+
+    const assetsResult = await pool
+      .request()
+      .input("author_id", sql.Int, authorId)
+      .input("story_id", sql.Int, storyId)
+      .query(`
+        SELECT
+          sm.memory_id,
+          sm.sort_order AS display_order,
+          mm.media_id,
+          CASE WHEN mm.storage_path IS NULL THEN NULL ELSE '/cdn/' + REPLACE(mm.storage_path, '\\', '/') END AS image_url
+        FROM dbo.identity_story_memory sm
+        INNER JOIN dbo.identity_memory_media mm
+          ON mm.memory_id = sm.memory_id
+         AND mm.author_id = sm.author_id
+         AND mm.media_type = 'image'
+         AND ISNULL(mm.is_deleted, 0) = 0
+        WHERE sm.story_id = @story_id
+          AND sm.author_id = @author_id
+        ORDER BY sm.sort_order ASC, ISNULL(mm.is_primary_for_memory, 0) DESC, mm.created_at ASC;
+      `);
+    const inheritedAssets = assetsResult?.recordset || [];
+
+    for (let index = 0; index < memoryRows.length; index += 1) {
+      const memoryId = Number(memoryRows[index]?.memory_id);
+      if (!Number.isInteger(memoryId) || memoryId <= 0) continue;
+
+      await pool
+        .request()
+        .input("author_id", sql.Int, authorId)
+        .input("chapter_id", sql.Int, chapterId)
+        .input("memory_id", sql.Int, memoryId)
+        .input("sort_order", sql.Int, index + 1)
+        .query(`
+          IF NOT EXISTS (
+            SELECT 1
+            FROM dbo.identity_memory_chapter
+            WHERE author_id = @author_id
+              AND chapter_id = @chapter_id
+              AND memory_id = @memory_id
+          )
+          BEGIN
+            INSERT INTO dbo.identity_memory_chapter
+            (
+              author_id,
+              chapter_id,
+              memory_id,
+              is_primary,
+              sort_order,
+              created_at,
+              created_by
+            )
+            VALUES
+            (
+              @author_id,
+              @chapter_id,
+              @memory_id,
+              0,
+              @sort_order,
+              SYSUTCDATETIME(),
+              @author_id
+            );
+          END
+        `);
+    }
+
+    try {
+      await linkStoryToChapter({
+        authorId,
+        chapterId,
+        storyId,
+        confidence: 1,
+        reason: "Capítulo criado diretamente a partir da História aprovada pelo autor.",
+        source: "chapters.from-story",
+      });
+    } catch (lineageError) {
+      console.warn("Story lineage from-story failed:", lineageError?.message);
+    }
+
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "chapter_created_from_story",
+        chapterId,
+        eventKey: buildEventKey("chapter_created_from_story", [
+          "author",
+          authorId,
+          "story",
+          storyId,
+          "chapter",
+          chapterId,
+        ]),
+        metadata: {
+          story_id: storyId,
+          chapter_id: chapterId,
+          chapter_version_id: chapterVersionId,
+          memory_ids: memoryRows.map((row) => Number(row.memory_id)).filter(Boolean),
+          inherited_story_assets: inheritedAssets,
+          source: "chapters.from-story",
+          regenerated: false,
+        },
+      });
+    } catch (eventError) {
+      console.warn("NarrativeEvent chapter_created_from_story failed:", eventError?.message);
+    }
+
+    return res.status(201).json({
+      ok: true,
+      story_id: storyId,
+      chapter_id: chapterId,
+      chapter_version_id: chapterVersionId,
+      status: "DRAFT",
+      publication_status: "DRAFT",
+      assets: inheritedAssets,
+      memory_count: memoryRows.length,
+      generation_mode: "AUTHOR_APPROVED_STORY",
+      regenerated: false,
+      source_policy: "Capítulo criado com o texto exato da História aprovada, sem nova geração por IA.",
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+
+router.post("/editorial/generate", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+    const userId = ensureUserId(req, res);
+    if (!userId) return;
+
+    const memoryIds = Array.isArray(req.body?.memory_ids)
+      ? req.body.memory_ids
+      : Array.isArray(req.body?.memoryIds)
+        ? req.body.memoryIds
+        : [];
+
+    const title = normalizeOptionalText(req.body?.title);
+
+    const pool = await getPool();
+    const planCheck = await checkNarrativeAiGenerationQuota({
+      pool,
+      userId,
+      requestedValue: 1,
+    });
+
+    if (!planCheck.allowed) {
+      return sendPlanDenied(res, planCheck, {
+        status: 403,
+        message: "A franquia mensal de Gerações Narrativas com IA (Histórias + Capítulos) foi atingida.",
+      });
+    }
+
+    const reservation = await reserveNarrativeAiGenerationQuota({
+      pool,
+      userId,
+      targetFeatureCode: "CHAPTER_AI_GENERATION_COUNT",
+      reserveValue: 1,
+      entityType: "CHAPTER_EDITORIAL_GENERATION",
+      entityId: null,
+      metadata: {
+        author_id: authorId,
+        source: "chapters.editorial.generate",
+        economic_operation: "CHAPTER_AI_GENERATION",
+      },
+    });
+
+    if (!reservation.allowed || !reservation.reservation_event_id) {
+      return sendPlanDenied(res, reservation, {
+        status: 403,
+        message: "A franquia mensal de Gerações Narrativas com IA (Histórias + Capítulos) foi atingida.",
+      });
+    }
+
+    let result;
+    try {
+      result = await generateEditorialChapter({
+        userId,
+        authorId,
+        memoryIds,
+        title,
+      });
+    } catch (error) {
+      try {
+        await releasePlanQuotaReservation({
+          pool,
+          userId,
+          reservationEventId: reservation.reservation_event_id,
+          reasonCode: error?.code || "CHAPTER_EDITORIAL_GENERATION_FAILED",
+          metadata: { author_id: authorId, source: "chapters.editorial.generate" },
+        });
+      } catch (releaseError) {
+        console.error("[PLAN][CHAPTER] Falha ao liberar reserva:", releaseError?.message || releaseError);
+      }
+      throw error;
+    }
+
+    const quotaResult = await commitPlanQuotaReservation({
+      pool,
+      userId,
+      reservationEventId: reservation.reservation_event_id,
+      metadata: {
+        author_id: authorId,
+        generation_id: result?.generation_id ?? null,
+        source: "chapters.editorial.generate",
+        economic_operation: "CHAPTER_AI_GENERATION",
+      },
+    });
+
+    if (!quotaResult.allowed) {
+      return res.status(409).json({
+        ok: false,
+        error: "A geração foi concluída, mas a reserva econômica não pôde ser consolidada.",
+        code: quotaResult.reason_code || "PLAN_QUOTA_COMMIT_FAILED",
+      });
+    }
+
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "chapter_editorial_generated",
+        eventKey: buildEventKey("chapter_editorial_generated", [
+          "author",
+          authorId,
+          "generation",
+          result.generation_id,
+        ]),
+        metadata: {
+          generation_id: result.generation_id,
+          source_memory_ids: result.source_memory_ids,
+          source_memory_count: result.source_memory_count,
+          source: "chapters.editorial.generate",
+        },
+      });
+    } catch (e) {
+      console.warn("NarrativeEvent chapter_editorial_generated failed:", e?.message);
+    }
+
+    return res.status(201).json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get("/editorial/generations/:generationId", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const generationId = toInt(req.params.generationId);
+    if (!Number.isFinite(generationId) || generationId <= 0) {
+      return res.status(400).json({ error: "generation_id inválido." });
+    }
+
+    const result = await getEditorialGeneration({ authorId, generationId });
+    return res.json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post("/editorial/generations/:generationId/approve", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const generationId = toInt(req.params.generationId);
+    if (!Number.isFinite(generationId) || generationId <= 0) {
+      return res.status(400).json({ error: "generation_id inválido." });
+    }
+
+    const result = await approveEditorialGeneration({
+      authorId,
+      generationId,
+      title: req.body?.title,
+      description: req.body?.description,
+      content: req.body?.content ?? req.body?.body,
+    });
+
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "chapter_editorial_approved",
+        chapterId: result.chapter_id ?? null,
+        eventKey: buildEventKey("chapter_editorial_approved", [
+          "author",
+          authorId,
+          "generation",
+          generationId,
+          "chapter",
+          result.chapter_id ?? "none",
+        ]),
+        metadata: {
+          generation_id: generationId,
+          chapter_id: result.chapter_id ?? null,
+          chapter_version_id: result.chapter_version_id ?? null,
+          linked_memory_ids: result.linked_memory_ids || [],
+          source: "chapters.editorial.approve",
+        },
+      });
+    } catch (e) {
+      console.warn("NarrativeEvent chapter_editorial_approved failed:", e?.message);
+    }
+
+    return res.json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.get("/:id", authRequired, async (req, res, next) => {
   try {
     const authorId = ensureAuthorId(req, res);
@@ -734,6 +1502,159 @@ router.get("/:id", authRequired, async (req, res, next) => {
   }
 });
 
+
+router.get("/:id/provenance", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const result = await getChapterProvenance({ authorId, chapterId });
+    return res.json(result);
+  } catch (err) {
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json({
+        error: err.message || "Falha ao carregar proveniência do capítulo.",
+        code: err.code || "CHAPTER_PROVENANCE_FAILED",
+      });
+    }
+    return next(err);
+  }
+});
+
+
+router.get("/:id/story-lineage", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+    const owned = await assertChapterOwned(pool, authorId, chapterId);
+    if (!owned) return res.status(404).json({ error: "Capítulo não encontrado." });
+
+    const lineage = await getChapterStoryLineage({ authorId, chapterId });
+    return res.json(lineage);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post("/:id/story-lineage", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    const storyId = toInt(req.body?.story_id ?? req.body?.storyId);
+
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    if (!Number.isFinite(storyId) || storyId <= 0) {
+      return res.status(400).json({ error: "story_id inválido." });
+    }
+
+    const pool = await getPool();
+    const owned = await assertChapterOwned(pool, authorId, chapterId);
+    if (!owned) return res.status(404).json({ error: "Capítulo não encontrado." });
+
+    const result = await linkStoryToChapter({
+      authorId,
+      chapterId,
+      storyId,
+      confidence: req.body?.confidence,
+      reason: req.body?.reason,
+      source: req.body?.source || "chapter.manual_lineage",
+    });
+
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "story_chapter_linked",
+        eventKey: buildEventKey(["story_chapter_linked", chapterId, storyId]),
+        entityType: "chapter",
+        entityId: chapterId,
+        metadata: {
+          chapter_id: chapterId,
+          story_id: storyId,
+          confidence: result?.link?.confidence ?? null,
+          source: "chapters.story-lineage.link",
+        },
+      });
+    } catch (e) {
+      console.warn("NarrativeEvent story_chapter_linked failed:", e?.message);
+    }
+
+    return res.json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post("/:id/story-lineage/rebuild", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+    const owned = await assertChapterOwned(pool, authorId, chapterId);
+    if (!owned) return res.status(404).json({ error: "Capítulo não encontrado." });
+
+    const result = await rebuildChapterStoryLineage({
+      authorId,
+      chapterId,
+      limit: req.body?.limit,
+      minConfidence: req.body?.min_confidence ?? req.body?.minConfidence,
+    });
+
+    return res.json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.delete("/:id/story-lineage/:storyId", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    const storyId = toInt(req.params.storyId);
+
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    if (!Number.isFinite(storyId) || storyId <= 0) {
+      return res.status(400).json({ error: "story_id inválido." });
+    }
+
+    const pool = await getPool();
+    const owned = await assertChapterOwned(pool, authorId, chapterId);
+    if (!owned) return res.status(404).json({ error: "Capítulo não encontrado." });
+
+    const result = await unlinkStoryFromChapter({ authorId, chapterId, storyId });
+    return res.json(result);
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.get("/:id/publication", authRequired, async (req, res, next) => {
   try {
     const authorId = ensureAuthorId(req, res);
@@ -759,6 +1680,319 @@ router.get("/:id/publication", authRequired, async (req, res, next) => {
   }
 });
 
+
+router.post("/:id/regenerate/accept", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res); if (!authorId) return;
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) return res.status(400).json({ error: "chapter_id inválido." });
+    const result = await acceptChapterRegeneration({
+      authorId, chapterId,
+      generationId: req.body?.generation_id,
+      sourceVersionId: req.body?.source_version_id,
+      title: req.body?.title,
+      description: req.body?.description ?? null,
+      body: req.body?.body,
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code || "CHAPTER_REGENERATION_ACCEPT_FAILED" });
+    return next(err);
+  }
+});
+
+router.post("/:id/regenerate/discard", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res); if (!authorId) return;
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) return res.status(400).json({ error: "chapter_id inválido." });
+    const result = await discardChapterRegeneration({ authorId, chapterId, generationId: req.body?.generation_id, sourceVersionId: req.body?.source_version_id });
+    return res.json(result);
+  } catch (err) {
+    if (err?.statusCode) return res.status(err.statusCode).json({ error: err.message, code: err.code || "CHAPTER_REGENERATION_DISCARD_FAILED" });
+    return next(err);
+  }
+});
+
+router.post("/:id/regenerate", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+    const userId = ensureUserId(req, res);
+    if (!userId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+
+    // Contrato econômico do Chapter Composer:
+    // - sem manuscrito existente = primeira geração por IA -> CHAPTER_AI_GENERATION_COUNT
+    // - com manuscrito existente = regeneração -> AI_REGENERATION_COUNT
+    //
+    // O evento CHAPTER_REGENERATED continua como marcador persistente auxiliar,
+    // inclusive se o autor posteriormente apagar manualmente o corpo do texto.
+    const [detail, priorAiGenerationResult] = await Promise.all([
+      getChapterEditorialState(pool, authorId, chapterId),
+      pool
+        .request()
+        .input("author_id", sql.Int, Number(authorId))
+        .input("chapter_id", sql.Int, Number(chapterId))
+        .query(`
+          SELECT TOP (1) 1 AS has_prior_ai_generation
+          FROM dbo.identity_chapter_evolution
+          WHERE author_id = @author_id
+            AND chapter_id = @chapter_id
+            AND event_type = 'CHAPTER_REGENERATED'
+          ORDER BY created_at DESC;
+        `),
+    ]);
+
+    if (!detail?.chapter) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    const hasExistingManuscript =
+      String(detail?.currentVersion?.body ?? "").trim().length > 0;
+    const hasPriorAiMarker =
+      Number(priorAiGenerationResult?.recordset?.[0]?.has_prior_ai_generation || 0) === 1;
+    const hasPriorAiGeneration = hasExistingManuscript || hasPriorAiMarker;
+
+    const quotaFeatureCode = hasPriorAiGeneration
+      ? "AI_REGENERATION_COUNT"
+      : "CHAPTER_AI_GENERATION_COUNT";
+
+    const planCheck = hasPriorAiGeneration
+      ? await checkPlanFeature({ pool, userId, featureCode: quotaFeatureCode, requestedValue: 1 })
+      : await checkNarrativeAiGenerationQuota({ pool, userId, requestedValue: 1 });
+
+    if (!planCheck.allowed) {
+      return sendPlanDenied(res, planCheck, {
+        status: 403,
+        message: hasPriorAiGeneration
+          ? "A franquia mensal de regenerações foi atingida."
+          : "A franquia mensal de Gerações Narrativas com IA (Histórias + Capítulos) foi atingida.",
+      });
+    }
+
+    const economicSource = hasPriorAiGeneration
+      ? "chapters.regenerate"
+      : "chapters.first_ai_manuscript";
+
+    const reservation = hasPriorAiGeneration
+      ? await reservePlanQuota({
+          pool,
+          userId,
+          featureCode: "AI_REGENERATION_COUNT",
+          reserveValue: 1,
+          entityType: "CHAPTER",
+          entityId: chapterId,
+          metadata: {
+            author_id: authorId,
+            source: economicSource,
+            economic_operation: "REGENERATION",
+          },
+        })
+      : await reserveNarrativeAiGenerationQuota({
+          pool,
+          userId,
+          targetFeatureCode: "CHAPTER_AI_GENERATION_COUNT",
+          reserveValue: 1,
+          entityType: "CHAPTER",
+          entityId: chapterId,
+          metadata: {
+            author_id: authorId,
+            source: economicSource,
+            economic_operation: "CHAPTER_AI_GENERATION",
+          },
+        });
+
+    if (!reservation.allowed || !reservation.reservation_event_id) {
+      return sendPlanDenied(res, reservation, {
+        status: 403,
+        message: hasPriorAiGeneration
+          ? "A franquia mensal de regenerações foi atingida."
+          : "A franquia mensal de Gerações Narrativas com IA (Histórias + Capítulos) foi atingida.",
+      });
+    }
+
+    let result;
+    try {
+      result = await regenerateChapter({
+        userId,
+        authorId,
+        chapterId,
+        title: req.body?.title ?? null,
+        // Defesa de contrato: se já existe versão corrente/manuscrito, /regenerate
+        // somente gera proposta. A persistência da próxima versão pertence exclusivamente
+        // a POST /:id/regenerate/accept.
+        proposalOnly: hasPriorAiGeneration || Number(detail?.chapter?.current_version_id || 0) > 0,
+      });
+    } catch (error) {
+      try {
+        await releasePlanQuotaReservation({
+          pool,
+          userId,
+          reservationEventId: reservation.reservation_event_id,
+          reasonCode: error?.code || "CHAPTER_REGENERATION_FAILED",
+          metadata: { author_id: authorId, chapter_id: chapterId, source: economicSource },
+        });
+      } catch (releaseError) {
+        console.error("[PLAN][CHAPTER] Falha ao liberar reserva:", releaseError?.message || releaseError);
+      }
+      throw error;
+    }
+
+    const quotaResult = await commitPlanQuotaReservation({
+      pool,
+      userId,
+      reservationEventId: reservation.reservation_event_id,
+      metadata: {
+        author_id: authorId,
+        chapter_id: chapterId,
+        source: economicSource,
+        economic_operation: hasPriorAiGeneration ? "REGENERATION" : "CHAPTER_AI_GENERATION",
+        target_version_id: result?.target_version_id ?? result?.chapter_version_id ?? null,
+      },
+    });
+
+    if (!quotaResult.allowed) {
+      return res.status(409).json({
+        ok: false,
+        error: "A operação foi concluída, mas a reserva econômica não pôde ser consolidada.",
+        code: quotaResult.reason_code || "PLAN_QUOTA_COMMIT_FAILED",
+      });
+    }
+
+    try {
+      const isProposal = result?.proposal === true;
+      const narrativeEventType = isProposal
+        ? "chapter_regeneration_proposed"
+        : "chapter_regenerated";
+
+      await createNarrativeEvent({
+        authorId,
+        eventType: narrativeEventType,
+        chapterId,
+        eventKey: buildEventKey(narrativeEventType, [
+          "author",
+          authorId,
+          "chapter",
+          chapterId,
+          isProposal ? "generation" : "version",
+          isProposal
+            ? (result.generation_id ?? result?.meta?.generation_id ?? "na")
+            : (result.target_version_id ?? result.chapter_version_id ?? "na"),
+        ]),
+        metadata: {
+          source_memory_count: result.source_memory_count ?? null,
+          source_memory_ids: result.source_memory_ids ?? [],
+          chapter_version_id: result.chapter_version_id ?? null,
+          source_version_id: result.source_version_id ?? null,
+          target_version_id: result.target_version_id ?? null,
+          provider: result?.meta?.provider ?? null,
+          model: result?.meta?.model ?? null,
+          prompt_version: result?.meta?.prompt_version ?? null,
+          generation_id: result.generation_id ?? result?.meta?.generation_id ?? null,
+          proposal: isProposal,
+          source: "chapters.regenerate",
+        },
+      });
+    } catch (e) {
+      console.warn("NarrativeEvent regeneration/proposal failed:", e?.message);
+    }
+
+    return res.status(201).json(result);
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (msg.includes("não encontrado") || msg.includes("acesso negado")) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+    if (err?.statusCode) {
+      return res.status(err.statusCode).json({
+        error: err.message || "Falha ao regenerar capítulo.",
+        code: err.code || "CHAPTER_REGENERATION_FAILED",
+        details: err.details || null,
+      });
+    }
+    return next(err);
+  }
+});
+
+router.get("/:id/versions", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+    const items = await listChapterVersions(pool, authorId, chapterId);
+    if (items === null) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    return res.json({
+      chapter_id: chapterId,
+      items,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get("/:id/timeline", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+    const items = await listChapterTimeline(pool, authorId, chapterId);
+    if (items === null) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    return res.json({
+      chapter_id: chapterId,
+      items,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get("/:id/editorial-profile", authRequired, async (req, res, next) => {
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+
+    const chapterId = toInt(req.params.id);
+    if (!Number.isFinite(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ error: "chapter_id inválido." });
+    }
+
+    const pool = await getPool();
+    const profile = await getChapterEditorialProfile(pool, authorId, chapterId);
+    if (profile === null) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    return res.json(profile);
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.put("/:id", authRequired, async (req, res, next) => {
   try {
     const authorId = ensureAuthorId(req, res);
@@ -778,6 +2012,53 @@ router.put("/:id", authRequired, async (req, res, next) => {
     if (body === null) return res.status(400).json({ error: "body é obrigatório." });
 
     const pool = await getPool();
+    const before = await getChapterEditorialState(pool, authorId, chapterId);
+    if (!before?.chapter) {
+      return res.status(404).json({ error: "Capítulo não encontrado." });
+    }
+
+    const currentTitle = String(before.chapter.title ?? "").trim();
+    const currentDescription =
+      before.chapter.description != null ? String(before.chapter.description).trim() : null;
+    const currentBody = String(before.currentVersion?.body ?? "");
+    const sourceVersionId = Number(
+      before.chapter.current_version_id ?? before.currentVersion?.chapter_version_id ?? 0
+    ) || null;
+
+    const titleChanged =
+      normalizeComparableText(title) !== normalizeComparableText(currentTitle);
+    const descriptionChanged =
+      normalizeComparableText(description) !== normalizeComparableText(currentDescription);
+    const bodyChanged =
+      normalizeComparableText(body) !== normalizeComparableText(currentBody);
+
+    if (!titleChanged && !descriptionChanged && !bodyChanged) {
+      return res.status(200).json({
+        ok: true,
+        updated: false,
+        code: "NO_CHANGES",
+        message: "Nenhuma alteração detectada. Nenhuma nova versão foi criada.",
+        chapter_id: chapterId,
+        chapter_version_id: sourceVersionId,
+        changes: {
+          title_changed: false,
+          description_changed: false,
+          body_changed: false,
+        },
+      });
+    }
+
+    // GAP #16 — antes de criar a nova versão, congela a proveniência da versão fonte.
+    // Em bases anteriores à implantação da tabela granular, getChapterProvenance executa
+    // um único backfill determinístico; dali em diante a cadeia é propagada versão a versão.
+    if (sourceVersionId) {
+      try {
+        await getChapterProvenance({ authorId, chapterId });
+      } catch (error) {
+        console.warn("Chapter provenance source bootstrap failed:", error?.message);
+      }
+    }
+
     const result = await pool
       .request()
       .input("author_id", sql.Int, authorId)
@@ -790,11 +2071,97 @@ router.put("/:id", authRequired, async (req, res, next) => {
 
     const out = result?.output || {};
     const firstRow = result?.recordset?.[0] || null;
+    const chapterVersionId =
+      out.chapter_version_id ?? firstRow?.chapter_version_id ?? null;
+
+    let granularProvenancePersisted = false;
+    if (sourceVersionId && chapterVersionId != null) {
+      try {
+        const persisted = await persistEditedVersionProvenance(pool, {
+          authorId,
+          chapterId,
+          sourceVersionId,
+          targetVersionId: Number(chapterVersionId),
+          sourceText: currentBody,
+          targetText: body,
+        });
+        granularProvenancePersisted = persisted.length > 0;
+      } catch (error) {
+        // Não quebra o save legado. A próxima leitura de provenance executará backfill,
+        // mas novas instalações com o SQL aplicado chegarão sempre pelo caminho persistido.
+        console.warn("Chapter granular provenance edit persist failed:", error?.message);
+      }
+    }
+
+    // GAP #7 — um capítulo PUBLIC permanece publicado na versão corrente.
+    // Ao existir edição real, a nova versão passa automaticamente a ser também
+    // a versão publicada, sem exigir Despublicar/Publicar novamente.
+    const wasPublic =
+      normalizePublicationStatus(
+        before.chapter.publication_status_effective ?? before.chapter.status
+      ) === "PUBLIC";
+
+    if (wasPublic && chapterVersionId != null) {
+      await pool
+        .request()
+        .input("author_id", sql.Int, authorId)
+        .input("chapter_id", sql.Int, chapterId)
+        .input("chapter_version_id", sql.Int, Number(chapterVersionId))
+        .query(`
+          UPDATE dbo.identity_chapter
+          SET
+            status = 'PUBLIC',
+            publication_status = 'PUBLIC',
+            published_version_number = @chapter_version_id,
+            published_at = COALESCE(published_at, SYSUTCDATETIME()),
+            updated_at = SYSUTCDATETIME()
+          WHERE chapter_id = @chapter_id
+            AND author_id = @author_id
+            AND ISNULL(is_deleted, 0) = 0;
+        `);
+    }
+
+    try {
+      await createChapterEvolution(pool, {
+        author_id: authorId,
+        chapter_id: chapterId,
+        event_type: "CHAPTER_EDITED",
+        source_version_id: sourceVersionId,
+        target_version_id:
+          chapterVersionId != null ? Number(chapterVersionId) : null,
+        memory_id: null,
+        metadata: {
+          source: "chapters.update",
+          title_changed: titleChanged,
+          description_changed: descriptionChanged,
+          body_changed: bodyChanged,
+          publication_status: wasPublic ? "PUBLIC" : "DRAFT",
+          published_version_number:
+            wasPublic && chapterVersionId != null ? Number(chapterVersionId) : null,
+          publication_auto_synced: wasPublic,
+          provenance_granularity: granularProvenancePersisted ? "PERSISTED_SEGMENTS_V1" : "DEFERRED_BACKFILL",
+        },
+      });
+    } catch (e) {
+      console.warn("ChapterEvolution CHAPTER_EDITED failed:", e?.message);
+    }
 
     return res.json({
+      ok: true,
+      updated: true,
       chapter_id: chapterId,
-      chapter_version_id:
-        out.chapter_version_id ?? firstRow?.chapter_version_id ?? null,
+      chapter_version_id: chapterVersionId,
+      source_version_id: sourceVersionId,
+      publication_status: wasPublic ? "PUBLIC" : normalizePublicationStatus(before.chapter.publication_status_effective ?? before.chapter.status),
+      published_version_number:
+        wasPublic && chapterVersionId != null ? Number(chapterVersionId) : before.chapter.published_version_number ?? null,
+      publication_auto_synced: wasPublic,
+      provenance_granularity: granularProvenancePersisted ? "PERSISTED_SEGMENTS_V1" : "DEFERRED_BACKFILL",
+      changes: {
+        title_changed: titleChanged,
+        description_changed: descriptionChanged,
+        body_changed: bodyChanged,
+      },
     });
   } catch (err) {
     const msg = String(err?.message || "");
@@ -870,6 +2237,23 @@ router.post("/:id/publish", authRequired, async (req, res, next) => {
       console.warn("NarrativeEvent chapter_published failed:", e?.message);
     }
 
+    try {
+      await createChapterEvolution(pool, {
+        author_id: authorId,
+        chapter_id: chapterId,
+        event_type: "CHAPTER_PUBLISHED",
+        source_version_id: publicationAfter.current_version_id ?? null,
+        target_version_id: publicationAfter.published_version_number ?? publicationAfter.current_version_id ?? null,
+        memory_id: null,
+        metadata: {
+          publication_status: "PUBLIC",
+          source: "chapters.publish",
+        },
+      });
+    } catch (e) {
+      console.warn("ChapterEvolution CHAPTER_PUBLISHED failed:", e?.message);
+    }
+
     return res.json({
       ok: true,
       chapter_id: chapterId,
@@ -938,6 +2322,24 @@ router.post("/:id/unpublish", authRequired, async (req, res, next) => {
       console.warn("NarrativeEvent chapter_unpublished failed:", e?.message);
     }
 
+    try {
+      const currentVersionId = await getCurrentChapterVersionId(pool, authorId, chapterId);
+      await createChapterEvolution(pool, {
+        author_id: authorId,
+        chapter_id: chapterId,
+        event_type: "CHAPTER_UNPUBLISHED",
+        source_version_id: currentVersionId,
+        target_version_id: currentVersionId,
+        memory_id: null,
+        metadata: {
+          publication_status: "DRAFT",
+          source: "chapters.unpublish",
+        },
+      });
+    } catch (e) {
+      console.warn("ChapterEvolution CHAPTER_UNPUBLISHED failed:", e?.message);
+    }
+
     return res.json({
       ok: true,
       chapter_id: chapterId,
@@ -990,12 +2392,36 @@ router.get("/:id/memories", authRequired, async (req, res, next) => {
           mc.is_primary,
           mc.sort_order,
           mc.created_at AS linked_at,
-          mc.created_by AS linked_by
+          mc.created_by AS linked_by,
+
+          media.media_id,
+          media.image_url,
+          media.image_url AS media_url,
+          media.image_url AS detail_url,
+          media.image_url AS feed_url
         FROM dbo.identity_memory_chapter mc
         INNER JOIN dbo.identity_memory m
           ON m.memory_id = mc.memory_id
         LEFT JOIN dbo.identity_phase p
           ON p.phase_id = m.phase_id
+        OUTER APPLY (
+          SELECT TOP 1
+            mm.media_id,
+            CASE
+              WHEN mm.storage_path IS NULL OR LTRIM(RTRIM(mm.storage_path)) = '' THEN NULL
+              WHEN mm.storage_path LIKE '/cdn/%' THEN REPLACE(mm.storage_path, '\\', '/')
+              ELSE '/cdn/' + REPLACE(mm.storage_path, '\\', '/')
+            END AS image_url
+          FROM dbo.identity_memory_media mm
+          WHERE mm.memory_id = m.memory_id
+            AND mm.author_id = m.author_id
+            AND LOWER(ISNULL(mm.media_type, '')) = 'image'
+            AND ISNULL(mm.is_deleted, 0) = 0
+          ORDER BY
+            ISNULL(mm.is_primary_for_memory, 0) DESC,
+            mm.created_at ASC,
+            mm.media_id ASC
+        ) media
         WHERE mc.chapter_id = @chapter_id
           AND mc.author_id  = @author_id
           AND m.author_id   = @author_id
@@ -1046,18 +2472,105 @@ router.post("/:id/suggest", authRequired, async (req, res, next) => {
           : 5,
     };
 
-    const result = await generateChapterSuggestion({
-      authorId,
-      chapterId,
-      options,
+    const userId = ensureUserId(req, res);
+    if (!userId) return;
+
+    const pool = await getPool();
+    const planCheck = await checkNarrativeAiGenerationQuota({
+      pool,
+      userId,
+      requestedValue: 1,
     });
 
+    if (!planCheck.allowed) {
+      return sendPlanDenied(res, planCheck, {
+        status: 403,
+        message: "A franquia mensal de Gerações Narrativas com IA (Histórias + Capítulos) foi atingida.",
+      });
+    }
+
+    const reservation = await reserveNarrativeAiGenerationQuota({
+      pool,
+      userId,
+      targetFeatureCode: "CHAPTER_AI_GENERATION_COUNT",
+      reserveValue: 1,
+      entityType: "CHAPTER_AI_SUGGESTION",
+      entityId: chapterId,
+      metadata: {
+        author_id: authorId,
+        chapter_id: chapterId,
+        source: "chapters.suggest",
+        economic_operation: "CHAPTER_AI_GENERATION",
+      },
+    });
+
+    if (!reservation.allowed || !reservation.reservation_event_id) {
+      return sendPlanDenied(res, reservation, {
+        status: 403,
+        message: "A franquia mensal de Gerações Narrativas com IA (Histórias + Capítulos) foi atingida.",
+      });
+    }
+
+    let result;
+    try {
+      result = await generateChapterSuggestion({
+        authorId,
+        chapterId,
+        options,
+      });
+    } catch (error) {
+      try {
+        await releasePlanQuotaReservation({
+          pool,
+          userId,
+          reservationEventId: reservation.reservation_event_id,
+          reasonCode: error?.code || "CHAPTER_SUGGEST_FAILED",
+          metadata: { author_id: authorId, chapter_id: chapterId, source: "chapters.suggest" },
+        });
+      } catch (releaseError) {
+        console.error("[PLAN][CHAPTER] Falha ao liberar reserva:", releaseError?.message || releaseError);
+      }
+      throw error;
+    }
+
     if (!result?.ok) {
+      try {
+        await releasePlanQuotaReservation({
+          pool,
+          userId,
+          reservationEventId: reservation.reservation_event_id,
+          reasonCode: result?.code || "CHAPTER_SUGGEST_FAILED",
+          metadata: { author_id: authorId, chapter_id: chapterId, source: "chapters.suggest" },
+        });
+      } catch (releaseError) {
+        console.error("[PLAN][CHAPTER] Falha ao liberar reserva:", releaseError?.message || releaseError);
+      }
       return res.status(result?.status || 400).json({
         ok: false,
         code: result?.code || "CHAPTER_SUGGEST_FAILED",
         message: result?.message || "Falha ao gerar sugestão de capítulo.",
         meta: result?.meta || null,
+      });
+    }
+
+    const quotaResult = await commitPlanQuotaReservation({
+      pool,
+      userId,
+      reservationEventId: reservation.reservation_event_id,
+      metadata: {
+        author_id: authorId,
+        chapter_id: chapterId,
+        suggestion_id: result?.suggestion_id ?? null,
+        source: "chapters.suggest",
+        economic_operation: "CHAPTER_AI_GENERATION",
+      },
+    });
+
+    if (!quotaResult.allowed) {
+      return res.status(409).json({
+        ok: false,
+        error: "A sugestão foi concluída, mas a reserva econômica não pôde ser consolidada.",
+        code: quotaResult.reason_code || "PLAN_QUOTA_COMMIT_FAILED",
       });
     }
 
@@ -1564,6 +3077,25 @@ router.post("/:id/memories/:memoryId", authRequired, async (req, res, next) => {
         console.warn("NarrativeEvent memory_linked_to_chapter failed:", e?.message);
       }
 
+      try {
+        const currentVersionId = await getCurrentChapterVersionId(pool, authorId, chapterId);
+        await createChapterEvolution(pool, {
+          author_id: authorId,
+          chapter_id: chapterId,
+          event_type: "CHAPTER_MEMORY_ADDED",
+          source_version_id: currentVersionId,
+          target_version_id: currentVersionId,
+          memory_id: memoryId,
+          metadata: {
+            is_primary_requested: requestedPrimary,
+            is_primary_effective: primaryChapterId === chapterId ? 1 : 0,
+            source: "chapters.link_memory",
+          },
+        });
+      } catch (e) {
+        console.warn("ChapterEvolution CHAPTER_MEMORY_ADDED failed:", e?.message);
+      }
+
       return res.status(201).json({
         ok: true,
         chapter_id: chapterId,
@@ -1851,6 +3383,24 @@ router.delete("/:id/memories/:memoryId", authRequired, async (req, res, next) =>
 
       await tx.commit();
 
+      try {
+        const currentVersionId = await getCurrentChapterVersionId(pool, authorId, chapterId);
+        await createChapterEvolution(pool, {
+          author_id: authorId,
+          chapter_id: chapterId,
+          event_type: "CHAPTER_MEMORY_REMOVED",
+          source_version_id: currentVersionId,
+          target_version_id: currentVersionId,
+          memory_id: memoryId,
+          metadata: {
+            removed_primary: wasPrimary,
+            source: "chapters.unlink_memory",
+          },
+        });
+      } catch (e) {
+        console.warn("ChapterEvolution CHAPTER_MEMORY_REMOVED failed:", e?.message);
+      }
+
       return res.json({
         ok: true,
         chapter_id: chapterId,
@@ -1962,6 +3512,71 @@ router.put("/:id/memories/:memoryId/order", authRequired, async (req, res, next)
     });
   } catch (err) {
     return next(err);
+  }
+});
+
+
+// GO LIVE 010 — Lifecycle Editorial de Capítulo
+router.delete("/:id", authRequired, async (req, res, next) => {
+  const transaction = new sql.Transaction(await getPool());
+  try {
+    const authorId = ensureAuthorId(req, res);
+    if (!authorId) return;
+    const chapterId = toInt(req.params.id);
+    if (!Number.isInteger(chapterId) || chapterId <= 0) {
+      return res.status(400).json({ ok: false, error: "chapterId inválido." });
+    }
+
+    await transaction.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
+    const request = new sql.Request(transaction);
+    request.input("author_id", sql.Int, authorId);
+    request.input("chapter_id", sql.Int, chapterId);
+
+    const exists = await request.query(`
+      SELECT TOP 1 chapter_id, publication_status
+      FROM dbo.identity_chapter
+      WHERE chapter_id=@chapter_id AND author_id=@author_id
+        AND ISNULL(is_deleted,0)=0;
+    `);
+    if (!exists.recordset?.[0]) {
+      await transaction.rollback();
+      return res.status(404).json({ ok: false, error: "Capítulo não encontrado." });
+    }
+
+    await request.query(`
+      DELETE FROM dbo.identity_memory_chapter
+      WHERE chapter_id=@chapter_id AND author_id=@author_id;
+
+      IF OBJECT_ID('dbo.identity_story_chapter_lineage','U') IS NOT NULL
+        DELETE FROM dbo.identity_story_chapter_lineage
+        WHERE chapter_id=@chapter_id AND author_id=@author_id;
+
+      UPDATE dbo.identity_chapter
+      SET is_deleted=1,
+          publication_status='DRAFT',
+          published_at=NULL,
+          updated_at=SYSUTCDATETIME()
+      WHERE chapter_id=@chapter_id AND author_id=@author_id
+        AND ISNULL(is_deleted,0)=0;
+    `);
+    await transaction.commit();
+
+    try {
+      await createNarrativeEvent({
+        authorId,
+        eventType: "chapter_deleted",
+        chapterId,
+        eventKey: buildEventKey("chapter_deleted", ["author", authorId, "chapter", chapterId]),
+        metadata: { source: "chapters.lifecycle", lifecycle: "ARCHIVED" },
+      });
+    } catch (eventError) {
+      console.warn("NarrativeEvent chapter_deleted failed:", eventError?.message);
+    }
+
+    return res.json({ ok: true, chapter_id: chapterId, deleted: true, lifecycle: "ARCHIVED" });
+  } catch (error) {
+    try { if (transaction._aborted !== true) await transaction.rollback(); } catch {}
+    return next(error);
   }
 });
 
